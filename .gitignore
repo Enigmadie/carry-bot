@@ -20,13 +20,24 @@ profile.cov
 # Dependency directories (remove the comment below to include it)
 # vendor/
 
-# Go workspace file
-go.work
+# go.work committed intentionally: monorepo, workspace file is part of the project
 go.work.sum
 
-# env file
+# Secrets — API keys live in env only, never in the repo
 .env
+.env.*
+
+# Build output
+/bin/
+
+# Local docker volumes / data
+/data/
 
 # Editor/IDE
-# .idea/
-# .vscode/
+.idea/
+.vscode/
+.DS_Store
+
+# Local working notes — not for the public repo
+TODO.md
+AGENTS.md
