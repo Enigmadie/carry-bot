@@ -1,0 +1,14 @@
+services:
+  nats:
+    image: nats:2.10-alpine
+    # -js enables JetStream; -sd sets its on-disk store; -m exposes monitoring.
+    command: ["-js", "-sd", "/data", "-m", "8222"]
+    ports:
+      - "4222:4222" # client connections
+      - "8222:8222" # http monitoring (http://localhost:8222)
+    volumes:
+      - nats-data:/data
+    restart: unless-stopped
+
+volumes:
+  nats-data:

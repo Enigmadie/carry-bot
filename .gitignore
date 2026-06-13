@@ -26,6 +26,7 @@ go.work.sum
 # Secrets — API keys live in env only, never in the repo
 .env
 .env.*
+!.env.example
 
 # Build output
 /bin/
@@ -41,3 +42,4 @@ go.work.sum
 # Local working notes — not for the public repo
 TODO.md
 AGENTS.md
+ARCHITECTURE.md
