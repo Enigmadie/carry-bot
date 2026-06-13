@@ -1,10 +1,10 @@
 .PHONY: dev dev-down market-data tidy build fmt vet
 
 dev: ## start local infra (NATS with JetStream)
-	docker compose -f deploy/docker-compose.yml up -d
+	docker compose -f deploy/docker-compose.dev.yml up -d
 
 dev-down: ## stop local infra
-	docker compose -f deploy/docker-compose.yml down
+	docker compose -f deploy/docker-compose.dev.yml down
 
 market-data: ## run the market-data service
 	go run ./services/market-data
