@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"sync"
 	"syscall"
 	"time"
 
@@ -28,6 +29,7 @@ const (
 type config struct {
 	NATSURL     string
 	LinearWSURL string
+	SpotWSURL   string
 	Symbol      string
 }
 
@@ -35,6 +37,7 @@ func loadConfig() config {
 	return config{
 		NATSURL:     getenv("NATS_URL", nats.DefaultURL),
 		LinearWSURL: getenv("BYBIT_WS_PUBLIC_LINEAR", "wss://stream-testnet.bybit.com/v5/public/linear"),
+		SpotWSURL:   getenv("BYBIT_WS_PUBLIC_SPOT", "wss://stream-testnet.bybit.com/v5/public/spot"),
 		Symbol:      getenv("SYMBOL", "BTCUSDT"),
 	}
 }
@@ -64,12 +67,33 @@ func main() {
 
 	s := &service{log: log, nc: nc, cfg: cfg}
 
-	// One feed for now: the linear (perp) tickers stream carries both the perp
-	// price and the predicted funding rate. Spot is the next addition.
-	if err := s.runStream(ctx, cfg.LinearWSURL, "tickers."+cfg.Symbol, s.handlePerpTicker); err != nil && ctx.Err() == nil {
-		log.Error("stream failed", "err", err)
-		os.Exit(1)
+	// Two independent feeds, one WebSocket each. The linear (perp) tickers
+	// stream carries the perp price and the predicted funding rate; the spot
+	// tickers stream carries only the spot price. Both reconnect on their own
+	// and unwind together when the root context is cancelled.
+	topic := "tickers." + cfg.Symbol
+	feeds := []struct {
+		url    string
+		handle func([]byte) error
+	}{
+		{cfg.LinearWSURL, s.handlePerpTicker},
+		{cfg.SpotWSURL, s.handleSpotTicker},
 	}
+
+	var wg sync.WaitGroup
+	for _, f := range feeds {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			// runStream only returns once the context is cancelled, so any
+			// non-context error here is genuinely fatal for this feed.
+			if err := s.runStream(ctx, f.url, topic, f.handle); err != nil && ctx.Err() == nil {
+				log.Error("stream failed", "url", f.url, "err", err)
+				stop() // bring the whole service down rather than run half-blind
+			}
+		}()
+	}
+	wg.Wait()
 	log.Info("shutdown complete")
 }
 
@@ -149,6 +173,17 @@ type tickerMessage struct {
 }
 
 func (s *service) handlePerpTicker(raw []byte) error {
+	return s.handleTicker(raw, events.SubjPricePerp, true)
+}
+
+func (s *service) handleSpotTicker(raw []byte) error {
+	return s.handleTicker(raw, events.SubjPriceSpot, false)
+}
+
+// handleTicker parses a Bybit tickers payload and republishes the price to
+// priceSubj. Only the perp feed carries a funding rate, so withFunding gates
+// the funding publish; spot tickers never include one.
+func (s *service) handleTicker(raw []byte, priceSubj string, withFunding bool) error {
 	var msg tickerMessage
 	if err := json.Unmarshal(raw, &msg); err != nil {
 		return fmt.Errorf("unmarshal: %w", err)
@@ -168,10 +203,10 @@ func (s *service) handlePerpTicker(raw []byte) error {
 		if err != nil {
 			return fmt.Errorf("lastPrice %q: %w", msg.Data.LastPrice, err)
 		}
-		s.publish(events.SubjPricePerp, events.Price{Symbol: symbol, Price: price, Time: now})
+		s.publish(priceSubj, events.Price{Symbol: symbol, Price: price, Time: now})
 	}
 
-	if msg.Data.FundingRate != "" {
+	if withFunding && msg.Data.FundingRate != "" {
 		rate, err := strconv.ParseFloat(msg.Data.FundingRate, 64)
 		if err != nil {
 			return fmt.Errorf("fundingRate %q: %w", msg.Data.FundingRate, err)
