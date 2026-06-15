@@ -41,3 +41,23 @@ type FundingRate struct {
 	NextSettleAt time.Time `json:"next_settle_at"`
 	Time         time.Time `json:"time"`
 }
+
+// Intent sides, carried in Intent.Side.
+const (
+	IntentOpen  = "open"
+	IntentClose = "close"
+)
+
+// Intent is a strategy decision to open or close the delta-neutral position.
+// It travels over JetStream so it survives a crash; order-service dedupes on ID
+// (a repeated at-least-once delivery must not open a second position).
+type Intent struct {
+	ID        string    `json:"id"` // unique per decision; downstream dedup key
+	Symbol    string    `json:"symbol"`
+	Side      string    `json:"side"`   // IntentOpen | IntentClose
+	Reason    string    `json:"reason"` // human-readable trigger
+	Funding   float64   `json:"funding"`
+	PerpPrice float64   `json:"perp_price"`
+	SpotPrice float64   `json:"spot_price"`
+	Time      time.Time `json:"time"`
+}
