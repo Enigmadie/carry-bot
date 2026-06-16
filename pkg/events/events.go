@@ -61,3 +61,18 @@ type Intent struct {
 	SpotPrice float64   `json:"spot_price"`
 	Time      time.Time `json:"time"`
 }
+
+// ExecReport is a fact emitted by order-service after acting on an Intent: the
+// position was opened, closed, or the attempt failed (possibly leaving an
+// unbalanced leg). It carries IntentID so portfolio-service can correlate it
+// with the originating decision. Published on the exec.* subjects.
+type ExecReport struct {
+	IntentID    string    `json:"intent_id"`
+	Symbol      string    `json:"symbol"`
+	Side        string    `json:"side"` // IntentOpen | IntentClose
+	Qty         float64   `json:"qty"`
+	SpotOrderID string    `json:"spot_order_id,omitempty"`
+	PerpOrderID string    `json:"perp_order_id,omitempty"`
+	Error       string    `json:"error,omitempty"` // set on SubjExecFailed
+	Time        time.Time `json:"time"`
+}
