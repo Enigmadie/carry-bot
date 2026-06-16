@@ -1,3 +1,9 @@
+# Load .env (gitignored) so secrets like BYBIT_API_KEY reach the services.
+# The leading `-` ignores a missing file; `export` pushes the values into the
+# environment of every recipe, where os.Getenv picks them up.
+-include .env
+export
+
 .PHONY: dev dev-down market-data strategy order tidy build fmt vet
 
 dev: ## start local infra (NATS with JetStream)
