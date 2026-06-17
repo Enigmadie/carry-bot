@@ -1,0 +1,15 @@
+# Keep the build context small and never ship local secrets/notes into an image
+# (matters when building on the Mac; on the ThinkCentre the context is a fresh
+# clone without these anyway).
+.git
+.env
+.env.*
+!.env.example
+/bin/
+/data/
+TODO.md
+AGENTS.md
+ARCHITECTURE.md
+.idea/
+.vscode/
+.DS_Store
