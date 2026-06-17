@@ -10,8 +10,9 @@
 //   - Leg risk. The spot long and the perp short cannot open atomically. We open
 //     them in sequence; if the second leg fails we roll the first one back so we
 //     never sit on a naked, directional position. A failure we cannot undo
-//     cleanly (a half-closed position) is reported and the bot halts that intent
-//     for a human — reconciliation against the exchange is a later step (§9).
+//     cleanly (a half-closed position) is reported and that intent is halted
+//     instead of retried, since clearing it needs manual intervention —
+//     automated reconciliation against the exchange is a later step.
 //
 // Like strategy, all mutable handling runs in a single worker goroutine, so the
 // leg orchestration never races with itself across concurrent redeliveries.
@@ -58,6 +59,7 @@ type config struct {
 	APIKey    string
 	APISecret string
 	OrderQty  string // base-coin amount per leg; intents carry no size
+	BindAddr  string // source IP for Bybit traffic; "" = default route
 }
 
 func loadConfig() config {
@@ -68,6 +70,7 @@ func loadConfig() config {
 		APIKey:    os.Getenv("BYBIT_API_KEY"),
 		APISecret: os.Getenv("BYBIT_API_SECRET"),
 		OrderQty:  getenv("ORDER_QTY", "0.001"),
+		BindAddr:  os.Getenv("BYBIT_BIND_ADDR"),
 	}
 }
 
@@ -103,10 +106,16 @@ func main() {
 		os.Exit(1)
 	}
 
+	client, err := bybit.New(cfg.BybitREST, cfg.APIKey, cfg.APISecret, cfg.BindAddr)
+	if err != nil {
+		log.Error("build bybit client", "err", err)
+		os.Exit(1)
+	}
+
 	s := &service{
 		log:    log,
 		js:     js,
-		client: bybit.New(cfg.BybitREST, cfg.APIKey, cfg.APISecret),
+		client: client,
 		cfg:    cfg,
 	}
 
@@ -331,7 +340,7 @@ func (s *service) emitFailed(ctx context.Context, in events.Intent, reason strin
 }
 
 // alert is a failure we cannot resolve automatically. Until notification-service
-// exists (§7) the alert is a loud log plus a durable exec.failed fact, which is
+// exists the alert is a loud log plus a durable exec.failed fact, which is
 // enough to wake someone via a Grafana/Prometheus alert later.
 func (s *service) alert(ctx context.Context, in events.Intent, reason string) {
 	s.log.Error("ALERT", "id", in.ID, "reason", reason)

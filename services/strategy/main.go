@@ -45,8 +45,8 @@ func loadConfig() config {
 
 // position is the in-memory state machine. v1 keeps it in memory only: a
 // restart forgets whether we hold a position. That is acceptable here because
-// reconciliation against the exchange at startup is a separate, later step
-// (TODO §9) — the exchange is the source of truth, not this process.
+// reconciliation against the exchange at startup is a separate, later step —
+// the exchange is the source of truth, not this process.
 type position int
 
 const (

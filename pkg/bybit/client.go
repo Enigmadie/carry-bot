@@ -1,6 +1,6 @@
 // Package bybit is a thin REST client for Bybit's V5 trading API. It signs
 // requests and exposes only what order-service needs today (placing market
-// orders); reconciliation and account queries come later (TODO §9).
+// orders); reconciliation and account queries come later.
 //
 // Bybit V5 auth: every private request carries four headers — the API key, a
 // millisecond timestamp, a recv-window, and an HMAC-SHA256 signature. The
@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -52,15 +53,43 @@ type Client struct {
 
 // New builds a client. recvWindow caps how far the server timestamp may drift
 // from ours before Bybit rejects the request, so accurate clocks matter on the
-// deploy box (TODO §9: NTP).
-func New(baseURL, apiKey, apiSecret string) *Client {
+// deploy box. bindAddr selects the outbound source IP; "" uses the default route.
+func New(baseURL, apiKey, apiSecret, bindAddr string) (*Client, error) {
+	hc, err := BoundHTTPClient(bindAddr, 10*time.Second)
+	if err != nil {
+		return nil, err
+	}
 	return &Client{
-		http:       &http.Client{Timeout: 10 * time.Second},
+		http:       hc,
 		baseURL:    strings.TrimRight(baseURL, "/"),
 		apiKey:     apiKey,
 		apiSecret:  apiSecret,
 		recvWindow: "5000",
+	}, nil
+}
+
+// BoundHTTPClient returns an *http.Client whose outbound connections use
+// bindAddr as their source IP; empty bindAddr keeps the default route, so the
+// bind is opt-in. Pass timeout 0 for long-lived connections like WebSockets — a
+// non-zero http.Client.Timeout caps the whole connection, not just the handshake.
+//
+// Binding the source IP lets Bybit traffic egress on a chosen interface
+// independently of the rest of the process.
+func BoundHTTPClient(bindAddr string, timeout time.Duration) (*http.Client, error) {
+	if bindAddr == "" {
+		return &http.Client{Timeout: timeout}, nil
 	}
+	ip := net.ParseIP(bindAddr)
+	if ip == nil {
+		return nil, fmt.Errorf("invalid bind addr %q", bindAddr)
+	}
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.DialContext = (&net.Dialer{
+		LocalAddr: &net.TCPAddr{IP: ip},
+		Timeout:   30 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}).DialContext
+	return &http.Client{Timeout: timeout, Transport: transport}, nil
 }
 
 // OrderRequest is the subset of /v5/order/create fields the bot uses. Bybit
