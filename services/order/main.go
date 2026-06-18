@@ -35,6 +35,8 @@ import (
 
 	"github.com/Enigmadie/carry-bot/pkg/bybit"
 	"github.com/Enigmadie/carry-bot/pkg/events"
+	"github.com/Enigmadie/carry-bot/pkg/exchange"
+	"github.com/Enigmadie/carry-bot/pkg/mock"
 )
 
 const (
@@ -53,39 +55,63 @@ const (
 var errRetry = errors.New("retry")
 
 type config struct {
-	NATSURL   string
-	Symbol    string
-	BybitREST string
-	APIKey    string
-	APISecret string
-	OrderQty  string // base-coin amount per leg; intents carry no size
-	BindAddr  string // source IP for Bybit traffic; "" = default route
+	NATSURL  string
+	Symbol   string
+	Provider string // EXCHANGE: mock | bybit
+	OrderQty string // base-coin amount per leg; intents carry no size
+
+	BybitREST   string
+	APIKey      string
+	APISecret   string
+	BindAddr    string // source IP for Bybit traffic; "" = default route
+	MockFailLeg string // mock only: category whose leg fails, for rollback testing
 }
 
 func loadConfig() config {
 	return config{
-		NATSURL:   getenv("NATS_URL", nats.DefaultURL),
-		Symbol:    getenv("SYMBOL", "BTCUSDT"),
-		BybitREST: getenv("BYBIT_REST", bybit.TestnetREST),
-		APIKey:    os.Getenv("BYBIT_API_KEY"),
-		APISecret: os.Getenv("BYBIT_API_SECRET"),
-		OrderQty:  getenv("ORDER_QTY", "0.001"),
-		BindAddr:  os.Getenv("BYBIT_BIND_ADDR"),
+		NATSURL:  getenv("NATS_URL", nats.DefaultURL),
+		Symbol:   getenv("SYMBOL", "BTCUSDT"),
+		Provider: getenv("EXCHANGE", "mock"),
+		OrderQty: getenv("ORDER_QTY", "0.001"),
+
+		BybitREST:   getenv("BYBIT_REST", bybit.TestnetREST),
+		APIKey:      os.Getenv("BYBIT_API_KEY"),
+		APISecret:   os.Getenv("BYBIT_API_SECRET"),
+		BindAddr:    os.Getenv("BYBIT_BIND_ADDR"),
+		MockFailLeg: os.Getenv("MOCK_FAIL_LEG"),
 	}
 }
 
 type service struct {
-	log    *slog.Logger
-	js     jetstream.JetStream
-	client *bybit.Client
-	cfg    config
+	log *slog.Logger
+	js  jetstream.JetStream
+	ex  exchange.Exchange
+	cfg config
+}
+
+// buildExchange selects the provider from config. mock-first: the default needs no
+// keys or network, so `make order` runs locally; bybit is opt-in via EXCHANGE.
+func buildExchange(cfg config) (exchange.Exchange, error) {
+	switch cfg.Provider {
+	case "mock":
+		return mock.New(cfg.MockFailLeg), nil
+	case "bybit":
+		if cfg.APIKey == "" || cfg.APISecret == "" {
+			return nil, errors.New("EXCHANGE=bybit requires BYBIT_API_KEY and BYBIT_API_SECRET")
+		}
+		return bybit.New(cfg.BybitREST, cfg.APIKey, cfg.APISecret, cfg.BindAddr)
+	default:
+		return nil, fmt.Errorf("unknown EXCHANGE provider %q", cfg.Provider)
+	}
 }
 
 func main() {
 	log := slog.New(slog.NewTextHandler(os.Stdout, nil))
 	cfg := loadConfig()
-	if cfg.APIKey == "" || cfg.APISecret == "" {
-		log.Error("BYBIT_API_KEY and BYBIT_API_SECRET are required")
+
+	ex, err := buildExchange(cfg)
+	if err != nil {
+		log.Error("build exchange", "err", err)
 		os.Exit(1)
 	}
 
@@ -106,17 +132,11 @@ func main() {
 		os.Exit(1)
 	}
 
-	client, err := bybit.New(cfg.BybitREST, cfg.APIKey, cfg.APISecret, cfg.BindAddr)
-	if err != nil {
-		log.Error("build bybit client", "err", err)
-		os.Exit(1)
-	}
-
 	s := &service{
-		log:    log,
-		js:     js,
-		client: client,
-		cfg:    cfg,
+		log: log,
+		js:  js,
+		ex:  ex,
+		cfg: cfg,
 	}
 
 	if err := s.run(ctx); err != nil && ctx.Err() == nil {
@@ -156,7 +176,7 @@ func (s *service) run(ctx context.Context) error {
 		return fmt.Errorf("ensure consumer: %w", err)
 	}
 	s.log.Info("consuming intents", "stream", intentStream, "durable", durableName,
-		"qty", s.cfg.OrderQty, "symbol", s.cfg.Symbol)
+		"exchange", s.cfg.Provider, "qty", s.cfg.OrderQty, "symbol", s.cfg.Symbol)
 
 	// Consume delivers on its own goroutines and may run callbacks concurrently.
 	// Funnel messages into one channel so a single worker processes intents
@@ -215,35 +235,39 @@ func (s *service) handle(ctx context.Context, m jetstream.Msg) {
 // leaves us flat rather than long. The spot leg is placed first because it is
 // the cheaper, more liquid one to unwind if we have to back out.
 func (s *service) openPosition(ctx context.Context, in events.Intent) error {
-	spot, err := s.placeLeg(ctx, in, bybit.OrderRequest{
-		Category:    bybit.CategorySpot,
+	spot, err := s.placeLeg(ctx, in, exchange.OrderRequest{
+		Category:    exchange.CategorySpot,
 		Symbol:      in.Symbol,
-		Side:        bybit.SideBuy,
+		Side:        exchange.SideBuy,
 		Qty:         s.cfg.OrderQty,
 		OrderLinkID: legID(in.ID, "s"),
 	})
 	if err != nil {
-		// Nothing opened yet — safe to redeliver and try the whole pair again.
+		// Nothing opened yet. A terminal reject (permission, balance) won't fix
+		// itself, so record it and stop; anything else gets a redelivery.
+		if s.ex.Classify(err) == exchange.ErrTerminal {
+			s.emitFailed(ctx, in, "spot leg failed: "+err.Error())
+			return nil
+		}
 		return fmt.Errorf("open spot leg: %w: %w", err, errRetry)
 	}
 
-	perp, err := s.placeLeg(ctx, in, bybit.OrderRequest{
-		Category:    bybit.CategoryLinear,
+	perp, err := s.placeLeg(ctx, in, exchange.OrderRequest{
+		Category:    exchange.CategoryLinear,
 		Symbol:      in.Symbol,
-		Side:        bybit.SideSell,
+		Side:        exchange.SideSell,
 		Qty:         s.cfg.OrderQty,
 		OrderLinkID: legID(in.ID, "p"),
 	})
 	if err != nil {
 		// Leg risk: spot is long but the perp short failed. Roll spot back so we
-		// don't hold a naked long. A retry of the whole intent must NOT happen
-		// (it would re-open spot), so this is terminal — we ack after rolling
-		// back and reporting.
+		// don't hold a naked long. Terminal regardless of the error kind — a retry
+		// would re-open the spot leg.
 		s.log.Error("perp leg failed, rolling back spot", "id", in.ID, "err", err)
-		if _, rbErr := s.placeLeg(ctx, in, bybit.OrderRequest{
-			Category:    bybit.CategorySpot,
+		if _, rbErr := s.placeLeg(ctx, in, exchange.OrderRequest{
+			Category:    exchange.CategorySpot,
 			Symbol:      in.Symbol,
-			Side:        bybit.SideSell,
+			Side:        exchange.SideSell,
 			Qty:         s.cfg.OrderQty,
 			OrderLinkID: legID(in.ID, "rb"),
 		}); rbErr != nil {
@@ -263,23 +287,27 @@ func (s *service) openPosition(ctx context.Context, in events.Intent) error {
 // clean rollback — re-opening to rebalance is its own risk — so if the second
 // leg fails we are left unbalanced and halt the intent for a human.
 func (s *service) closePosition(ctx context.Context, in events.Intent) error {
-	perp, err := s.placeLeg(ctx, in, bybit.OrderRequest{
-		Category:    bybit.CategoryLinear,
+	perp, err := s.placeLeg(ctx, in, exchange.OrderRequest{
+		Category:    exchange.CategoryLinear,
 		Symbol:      in.Symbol,
-		Side:        bybit.SideBuy,
+		Side:        exchange.SideBuy,
 		Qty:         s.cfg.OrderQty,
 		OrderLinkID: legID(in.ID, "p"),
 		ReduceOnly:  true,
 	})
 	if err != nil {
-		// Nothing changed yet — redeliver and retry the full close.
+		// Nothing changed yet. Terminal → record and stop; otherwise redeliver.
+		if s.ex.Classify(err) == exchange.ErrTerminal {
+			s.emitFailed(ctx, in, "close perp leg failed: "+err.Error())
+			return nil
+		}
 		return fmt.Errorf("close perp leg: %w: %w", err, errRetry)
 	}
 
-	spot, err := s.placeLeg(ctx, in, bybit.OrderRequest{
-		Category:    bybit.CategorySpot,
+	spot, err := s.placeLeg(ctx, in, exchange.OrderRequest{
+		Category:    exchange.CategorySpot,
 		Symbol:      in.Symbol,
-		Side:        bybit.SideSell,
+		Side:        exchange.SideSell,
 		Qty:         s.cfg.OrderQty,
 		OrderLinkID: legID(in.ID, "s"),
 	})
@@ -295,14 +323,14 @@ func (s *service) closePosition(ctx context.Context, in events.Intent) error {
 // placeLeg submits one order. A duplicate orderLinkId means a previous delivery
 // already placed this exact leg, so we treat it as success (idempotent replay)
 // rather than an error.
-func (s *service) placeLeg(ctx context.Context, in events.Intent, req bybit.OrderRequest) (*bybit.OrderResult, error) {
-	res, err := s.client.PlaceOrder(ctx, req)
-	if bybit.IsDuplicate(err) {
-		s.log.Info("leg already placed (idempotent replay)",
-			"id", in.ID, "link", req.OrderLinkID, "category", req.Category)
-		return &bybit.OrderResult{OrderLinkID: req.OrderLinkID}, nil
-	}
+func (s *service) placeLeg(ctx context.Context, in events.Intent, req exchange.OrderRequest) (*exchange.OrderResult, error) {
+	res, err := s.ex.PlaceOrder(ctx, req)
 	if err != nil {
+		if s.ex.Classify(err) == exchange.ErrDuplicate {
+			s.log.Info("leg already placed (idempotent replay)",
+				"id", in.ID, "link", req.OrderLinkID, "category", req.Category)
+			return &exchange.OrderResult{OrderLinkID: req.OrderLinkID}, nil
+		}
 		return nil, err
 	}
 	s.log.Info("leg placed", "id", in.ID, "category", req.Category,
@@ -316,7 +344,7 @@ func legID(intentID, leg string) string {
 	return intentID + "-" + leg
 }
 
-func (s *service) emitOpened(ctx context.Context, in events.Intent, spot, perp *bybit.OrderResult) {
+func (s *service) emitOpened(ctx context.Context, in events.Intent, spot, perp *exchange.OrderResult) {
 	s.emit(ctx, events.SubjPositionOpened, events.ExecReport{
 		IntentID: in.ID, Symbol: in.Symbol, Side: in.Side, Qty: s.qty(),
 		SpotOrderID: spot.OrderID, PerpOrderID: perp.OrderID, Time: time.Now().UTC(),
@@ -324,7 +352,7 @@ func (s *service) emitOpened(ctx context.Context, in events.Intent, spot, perp *
 	s.log.Info("position opened", "id", in.ID, "reason", in.Reason)
 }
 
-func (s *service) emitClosed(ctx context.Context, in events.Intent, spot, perp *bybit.OrderResult) {
+func (s *service) emitClosed(ctx context.Context, in events.Intent, spot, perp *exchange.OrderResult) {
 	s.emit(ctx, events.SubjPositionClosed, events.ExecReport{
 		IntentID: in.ID, Symbol: in.Symbol, Side: in.Side, Qty: s.qty(),
 		SpotOrderID: spot.OrderID, PerpOrderID: perp.OrderID, Time: time.Now().UTC(),

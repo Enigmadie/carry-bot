@@ -1,13 +1,10 @@
-// Package bybit is a thin REST client for Bybit's V5 trading API. It signs
-// requests and exposes only what order-service needs today (placing market
-// orders); reconciliation and account queries come later.
+// Package bybit is a thin, signed Bybit V5 REST client implementing
+// exchange.Exchange. Kept as a rudiment behind the interface after the pivot to
+// Hyperliquid — it works end-to-end on testnet and may be useful again.
 //
-// Bybit V5 auth: every private request carries four headers — the API key, a
-// millisecond timestamp, a recv-window, and an HMAC-SHA256 signature. The
-// signature is hex(HMAC(secret, timestamp + apiKey + recvWindow + payload)),
-// where payload is the raw request body for POST (or the query string for GET).
-// The body bytes that are signed must be byte-for-byte the bytes that are sent,
-// so we marshal once and reuse the result.
+// V5 auth: each private request carries the API key, a ms timestamp, a recv
+// window, and an HMAC-SHA256 signature over timestamp+apiKey+recvWindow+body.
+// The signed bytes must be the exact bytes sent, so the body is marshaled once.
 package bybit
 
 import (
@@ -25,24 +22,12 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/Enigmadie/carry-bot/pkg/exchange"
 )
 
-// TestnetREST is Bybit's testnet REST host; the bot defaults to it.
 const TestnetREST = "https://api-testnet.bybit.com"
 
-// Order categories.
-const (
-	CategorySpot   = "spot"
-	CategoryLinear = "linear"
-)
-
-// Order sides.
-const (
-	SideBuy  = "Buy"
-	SideSell = "Sell"
-)
-
-// Client is a signed Bybit V5 REST client. It is safe for concurrent use.
 type Client struct {
 	http       *http.Client
 	baseURL    string
@@ -51,9 +36,9 @@ type Client struct {
 	recvWindow string
 }
 
-// New builds a client. recvWindow caps how far the server timestamp may drift
-// from ours before Bybit rejects the request, so accurate clocks matter on the
-// deploy box. bindAddr selects the outbound source IP; "" uses the default route.
+// New builds a client. recvWindow caps server-clock drift before Bybit rejects a
+// request, so clocks matter on the deploy box. bindAddr selects the outbound
+// source IP; "" uses the default route.
 func New(baseURL, apiKey, apiSecret, bindAddr string) (*Client, error) {
 	hc, err := BoundHTTPClient(bindAddr, 10*time.Second)
 	if err != nil {
@@ -68,13 +53,9 @@ func New(baseURL, apiKey, apiSecret, bindAddr string) (*Client, error) {
 	}, nil
 }
 
-// BoundHTTPClient returns an *http.Client whose outbound connections use
-// bindAddr as their source IP; empty bindAddr keeps the default route, so the
-// bind is opt-in. Pass timeout 0 for long-lived connections like WebSockets — a
-// non-zero http.Client.Timeout caps the whole connection, not just the handshake.
-//
-// Binding the source IP lets Bybit traffic egress on a chosen interface
-// independently of the rest of the process.
+// BoundHTTPClient returns an *http.Client whose connections egress from bindAddr;
+// empty bindAddr keeps the default route. Pass timeout 0 for long-lived sockets
+// like WebSockets — a non-zero Timeout caps the whole connection, not the handshake.
 func BoundHTTPClient(bindAddr string, timeout time.Duration) (*http.Client, error) {
 	if bindAddr == "" {
 		return &http.Client{Timeout: timeout}, nil
@@ -92,26 +73,7 @@ func BoundHTTPClient(bindAddr string, timeout time.Duration) (*http.Client, erro
 	return &http.Client{Timeout: timeout, Transport: transport}, nil
 }
 
-// OrderRequest is the subset of /v5/order/create fields the bot uses. Bybit
-// wants every numeric value as a string.
-type OrderRequest struct {
-	Category    string // CategorySpot | CategoryLinear
-	Symbol      string
-	Side        string // SideBuy | SideSell
-	Qty         string // base-coin amount (see MarketUnit for spot)
-	OrderLinkID string // client-side id; Bybit dedupes on it (idempotency key)
-	ReduceOnly  bool   // perp only: this order may only shrink an existing position
-}
-
-// OrderResult is the useful slice of a successful order/create response.
-type OrderResult struct {
-	OrderID     string
-	OrderLinkID string
-}
-
-// APIError is a non-zero retCode from Bybit. The caller inspects Code to tell a
-// retryable transport-level problem (there is none here — that surfaces as a
-// plain error) from a business rejection like a duplicate order link id.
+// APIError is a non-zero retCode from Bybit. Classify maps Code to an ErrorKind.
 type APIError struct {
 	Code int
 	Msg  string
@@ -121,30 +83,7 @@ func (e *APIError) Error() string {
 	return fmt.Sprintf("bybit retCode %d: %s", e.Code, e.Msg)
 }
 
-// IsDuplicate reports whether err means "an order with this orderLinkId already
-// exists". That is the idempotency signal: a JetStream redelivery replays the
-// same intent, we rebuild the same orderLinkId, and Bybit refuses the second
-// copy — which for us is success, not failure. Bybit's exact code varies by
-// product and has shifted across releases, so we also fall back to the message
-// text. Verify the precise code on testnet before trusting real money.
-func IsDuplicate(err error) bool {
-	var apiErr *APIError
-	if !errors.As(err, &apiErr) {
-		return false
-	}
-	switch apiErr.Code {
-	case 10001: // generic params error — disambiguated by message below
-	case 110079, 170130, 110072: // observed "orderLinkId duplicate" variants
-		return true
-	}
-	msg := strings.ToLower(apiErr.Msg)
-	return strings.Contains(msg, "duplicate") ||
-		strings.Contains(msg, "orderlinkid") && strings.Contains(msg, "exist")
-}
-
-// PlaceOrder submits a market order. A duplicate orderLinkId is reported as an
-// APIError; callers use IsDuplicate to treat it as an idempotent no-op.
-func (c *Client) PlaceOrder(ctx context.Context, req OrderRequest) (*OrderResult, error) {
+func (c *Client) PlaceOrder(ctx context.Context, req exchange.OrderRequest) (*exchange.OrderResult, error) {
 	body := map[string]any{
 		"category":    req.Category,
 		"symbol":      req.Symbol,
@@ -153,16 +92,16 @@ func (c *Client) PlaceOrder(ctx context.Context, req OrderRequest) (*OrderResult
 		"qty":         req.Qty,
 		"orderLinkId": req.OrderLinkID,
 	}
-	// Spot market orders default to interpreting qty as the quote amount; we
-	// want a base-coin amount so the spot leg matches the perp leg one-to-one.
-	if req.Category == CategorySpot {
+	// Spot market orders read qty as the quote amount by default; force base-coin
+	// so the spot leg matches the perp leg one-to-one.
+	if req.Category == exchange.CategorySpot {
 		body["marketUnit"] = "baseCoin"
 	}
 	if req.ReduceOnly {
 		body["reduceOnly"] = true
 	}
 
-	var res OrderResult
+	var res exchange.OrderResult
 	if err := c.signedPost(ctx, "/v5/order/create", body, &struct {
 		OrderID     *string `json:"orderId"`
 		OrderLinkID *string `json:"orderLinkId"`
@@ -172,8 +111,37 @@ func (c *Client) PlaceOrder(ctx context.Context, req OrderRequest) (*OrderResult
 	return &res, nil
 }
 
-// signedPost marshals body once, signs those exact bytes, sends them, and
-// decodes result into out. A non-zero retCode becomes an *APIError.
+// Classify maps a PlaceOrder error onto an exchange.ErrorKind. A non-APIError is a
+// transport blip (transient); duplicate orderLinkId, regulatory bans, and
+// insufficient balance are pinned by code with a message fallback, since Bybit's
+// exact codes drift across products and releases. Verify codes on testnet.
+func (c *Client) Classify(err error) exchange.ErrorKind {
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		return exchange.ErrTransient
+	}
+	switch apiErr.Code {
+	case 110079, 170130, 110072:
+		return exchange.ErrDuplicate
+	case 10024: // regulatory/permission — never resolves on retry
+		return exchange.ErrTerminal
+	case 170131, 110007: // insufficient balance — needs funding, not a retry
+		return exchange.ErrTerminal
+	}
+	msg := strings.ToLower(apiErr.Msg)
+	switch {
+	case strings.Contains(msg, "duplicate"),
+		strings.Contains(msg, "orderlinkid") && strings.Contains(msg, "exist"):
+		return exchange.ErrDuplicate
+	case strings.Contains(msg, "insufficient balance"),
+		strings.Contains(msg, "regulat"):
+		return exchange.ErrTerminal
+	}
+	return exchange.ErrOther
+}
+
+// signedPost marshals body once, signs those exact bytes, sends them, and decodes
+// result into out. A non-zero retCode becomes an *APIError.
 func (c *Client) signedPost(ctx context.Context, path string, body, out any) error {
 	payload, err := json.Marshal(body)
 	if err != nil {
