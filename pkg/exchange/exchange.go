@@ -30,6 +30,9 @@ type OrderRequest struct {
 type OrderResult struct {
 	OrderID     string
 	OrderLinkID string
+	Price       float64 // fill price; 0 if the provider doesn't report it synchronously
+	Fee         float64 // fee paid on this fill, in quote currency
+	FilledQty   float64
 }
 
 // ErrorKind buckets a provider error into the handling cases order-service acts on,

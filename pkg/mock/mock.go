@@ -8,9 +8,18 @@ package mock
 import (
 	"context"
 	"errors"
+	"strconv"
 	"sync"
 
 	"github.com/Enigmadie/carry-bot/pkg/exchange"
+)
+
+// Synthetic fills. Both legs price at the same point so a delta-neutral round
+// trip nets zero on price and the only realized cost is the fee — which is the
+// honest picture: the strategy earns from funding (phase 2), not price moves.
+const (
+	mockPrice   = 65000.0
+	mockFeeRate = 0.0005
 )
 
 var (
@@ -43,7 +52,14 @@ func (m *Exchange) PlaceOrder(_ context.Context, req exchange.OrderRequest) (*ex
 	}
 	orderID := "mock-" + req.OrderLinkID
 	m.seen[req.OrderLinkID] = orderID
-	return &exchange.OrderResult{OrderID: orderID, OrderLinkID: req.OrderLinkID}, nil
+	qty, _ := strconv.ParseFloat(req.Qty, 64)
+	return &exchange.OrderResult{
+		OrderID:     orderID,
+		OrderLinkID: req.OrderLinkID,
+		Price:       mockPrice,
+		Fee:         qty * mockPrice * mockFeeRate,
+		FilledQty:   qty,
+	}, nil
 }
 
 func (m *Exchange) Classify(err error) exchange.ErrorKind {

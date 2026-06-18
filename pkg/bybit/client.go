@@ -101,6 +101,8 @@ func (c *Client) PlaceOrder(ctx context.Context, req exchange.OrderRequest) (*ex
 		body["reduceOnly"] = true
 	}
 
+	// V5 order/create returns only ids, not fill price/fee — those need a follow-up
+	// execution query. Left at zero here; portfolio P&L on bybit waits on that.
 	var res exchange.OrderResult
 	if err := c.signedPost(ctx, "/v5/order/create", body, &struct {
 		OrderID     *string `json:"orderId"`

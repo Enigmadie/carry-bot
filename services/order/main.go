@@ -347,7 +347,9 @@ func legID(intentID, leg string) string {
 func (s *service) emitOpened(ctx context.Context, in events.Intent, spot, perp *exchange.OrderResult) {
 	s.emit(ctx, events.SubjPositionOpened, events.ExecReport{
 		IntentID: in.ID, Symbol: in.Symbol, Side: in.Side, Qty: s.qty(),
-		SpotOrderID: spot.OrderID, PerpOrderID: perp.OrderID, Time: time.Now().UTC(),
+		SpotOrderID: spot.OrderID, PerpOrderID: perp.OrderID,
+		SpotPrice: spot.Price, PerpPrice: perp.Price, Fee: spot.Fee + perp.Fee,
+		Time: time.Now().UTC(),
 	})
 	s.log.Info("position opened", "id", in.ID, "reason", in.Reason)
 }
@@ -355,7 +357,9 @@ func (s *service) emitOpened(ctx context.Context, in events.Intent, spot, perp *
 func (s *service) emitClosed(ctx context.Context, in events.Intent, spot, perp *exchange.OrderResult) {
 	s.emit(ctx, events.SubjPositionClosed, events.ExecReport{
 		IntentID: in.ID, Symbol: in.Symbol, Side: in.Side, Qty: s.qty(),
-		SpotOrderID: spot.OrderID, PerpOrderID: perp.OrderID, Time: time.Now().UTC(),
+		SpotOrderID: spot.OrderID, PerpOrderID: perp.OrderID,
+		SpotPrice: spot.Price, PerpPrice: perp.Price, Fee: spot.Fee + perp.Fee,
+		Time: time.Now().UTC(),
 	})
 	s.log.Info("position closed", "id", in.ID, "reason", in.Reason)
 }

@@ -73,6 +73,9 @@ type ExecReport struct {
 	Qty         float64   `json:"qty"`
 	SpotOrderID string    `json:"spot_order_id,omitempty"`
 	PerpOrderID string    `json:"perp_order_id,omitempty"`
+	SpotPrice   float64   `json:"spot_price,omitempty"` // fill prices/fees per leg, for portfolio P&L
+	PerpPrice   float64   `json:"perp_price,omitempty"`
+	Fee         float64   `json:"fee,omitempty"`   // total fee across both legs, quote currency
 	Error       string    `json:"error,omitempty"` // set on SubjExecFailed
 	Time        time.Time `json:"time"`
 }

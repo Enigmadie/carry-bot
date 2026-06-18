@@ -4,7 +4,7 @@
 -include .env
 export
 
-.PHONY: dev dev-down market-data strategy order tidy build fmt vet
+.PHONY: dev dev-down market-data strategy order portfolio tidy build fmt vet
 
 dev: ## start local infra (NATS with JetStream)
 	docker compose -f deploy/docker-compose.dev.yml up -d
@@ -18,8 +18,11 @@ market-data: ## run the market-data service
 strategy: ## run the strategy service
 	go run ./services/strategy
 
-order: ## run the order service (needs BYBIT_API_KEY / BYBIT_API_SECRET)
+order: ## run the order service (EXCHANGE=mock default; bybit needs API keys)
 	go run ./services/order
+
+portfolio: ## run the portfolio service (needs Postgres via DATABASE_URL)
+	go run ./services/portfolio
 
 tidy: ## sync go.mod / go.sum
 	go mod tidy
