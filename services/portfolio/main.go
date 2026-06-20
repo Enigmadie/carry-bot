@@ -51,6 +51,17 @@ CREATE TABLE IF NOT EXISTS positions (
     realized_pnl     DOUBLE PRECISION,
     opened_at        TIMESTAMPTZ NOT NULL,
     closed_at        TIMESTAMPTZ
+);
+
+-- Funding ledger: one row per settlement, keyed by the exchange's payment id.
+-- The PK makes booking idempotent — a redelivered exec.funding.received that
+-- conflicts on payment_id is dropped, so funding_total is never double-counted.
+CREATE TABLE IF NOT EXISTS funding_payments (
+    payment_id  TEXT PRIMARY KEY,
+    position_id BIGINT REFERENCES positions(id),
+    symbol      TEXT NOT NULL,
+    amount      DOUBLE PRECISION NOT NULL,
+    received_at TIMESTAMPTZ NOT NULL
 );`
 
 type config struct {
@@ -127,7 +138,7 @@ func (s *service) run(ctx context.Context) error {
 	cons, err := s.js.CreateOrUpdateConsumer(ctx, execStream, jetstream.ConsumerConfig{
 		Durable:        durableName,
 		AckPolicy:      jetstream.AckExplicitPolicy,
-		FilterSubjects: []string{events.SubjPositionOpened, events.SubjPositionClosed, events.SubjExecFailed},
+		FilterSubjects: []string{events.SubjPositionOpened, events.SubjPositionClosed, events.SubjExecFailed, events.SubjFundingReceived},
 		AckWait:        ackWait,
 		MaxDeliver:     maxDeliver,
 	})
@@ -154,6 +165,13 @@ func (s *service) run(ctx context.Context) error {
 }
 
 func (s *service) handle(ctx context.Context, m jetstream.Msg) {
+	// Funding rides the same EXEC stream but carries a different payload, so it
+	// branches off before the ExecReport decode.
+	if m.Subject() == events.SubjFundingReceived {
+		s.handleFunding(ctx, m)
+		return
+	}
+
 	var r events.ExecReport
 	if err := json.Unmarshal(m.Data(), &r); err != nil {
 		s.log.Error("unmarshal exec report", "err", err)
@@ -239,6 +257,73 @@ func (s *service) onClosed(ctx context.Context, r events.ExecReport) error {
 	}
 	s.log.Info("position closed", "intent", r.IntentID, "realized_pnl", pnl)
 	return nil
+}
+
+func (s *service) handleFunding(ctx context.Context, m jetstream.Msg) {
+	var f events.FundingReceived
+	if err := json.Unmarshal(m.Data(), &f); err != nil {
+		s.log.Error("unmarshal funding", "err", err)
+		m.Term()
+		return
+	}
+	if err := s.onFunding(ctx, f); err != nil {
+		s.log.Warn("db write failed, will retry", "payment", f.PaymentID, "err", err)
+		m.Nak()
+		return
+	}
+	m.Ack()
+}
+
+const insertFunding = `
+INSERT INTO funding_payments (payment_id, position_id, symbol, amount, received_at)
+VALUES ($1, $2, $3, $4, $5)
+ON CONFLICT (payment_id) DO NOTHING;`
+
+// onFunding books one settlement: it attaches the payment to the currently open
+// position (if any) and adds it to that position's funding_total, all in one
+// transaction so the ledger row and the running total never diverge. The ledger
+// PK makes a redelivery a no-op — the conflicting insert affects no row, so we
+// skip the increment. Funding that arrives while flat is recorded unattached
+// (position_id NULL) and does not move any total.
+func (s *service) onFunding(ctx context.Context, f events.FundingReceived) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	var posID int64
+	hasOpen := true
+	err = tx.QueryRow(ctx,
+		`SELECT id FROM positions WHERE status = 'open' ORDER BY opened_at DESC LIMIT 1`).Scan(&posID)
+	if err == pgx.ErrNoRows {
+		hasOpen = false
+	} else if err != nil {
+		return err
+	}
+
+	var posParam any
+	if hasOpen {
+		posParam = posID
+	}
+	tag, err := tx.Exec(ctx, insertFunding, f.PaymentID, posParam, f.Symbol, f.Amount, f.Time)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		s.log.Info("funding already booked (idempotent replay)", "payment", f.PaymentID)
+		return tx.Commit(ctx)
+	}
+	if !hasOpen {
+		s.log.Warn("funding received while flat, recorded unattached", "payment", f.PaymentID, "amount", f.Amount)
+		return tx.Commit(ctx)
+	}
+	if _, err := tx.Exec(ctx,
+		`UPDATE positions SET funding_total = funding_total + $1 WHERE id = $2`, f.Amount, posID); err != nil {
+		return err
+	}
+	s.log.Info("funding booked", "payment", f.PaymentID, "position", posID, "amount", f.Amount)
+	return tx.Commit(ctx)
 }
 
 func getenv(key, def string) string {

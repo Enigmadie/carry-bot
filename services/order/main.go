@@ -60,6 +60,8 @@ type config struct {
 	Provider string // EXCHANGE: mock | bybit
 	OrderQty string // base-coin amount per leg; intents carry no size
 
+	FundingPoll time.Duration // how often to poll the exchange for funding; 0 disables
+
 	BybitREST   string
 	APIKey      string
 	APISecret   string
@@ -73,6 +75,8 @@ func loadConfig() config {
 		Symbol:   getenv("SYMBOL", "BTCUSDT"),
 		Provider: getenv("EXCHANGE", "mock"),
 		OrderQty: getenv("ORDER_QTY", "0.001"),
+
+		FundingPoll: getdur("FUNDING_POLL", 30*time.Second),
 
 		BybitREST:   getenv("BYBIT_REST", bybit.TestnetREST),
 		APIKey:      os.Getenv("BYBIT_API_KEY"),
@@ -187,6 +191,10 @@ func (s *service) run(ctx context.Context) error {
 		return fmt.Errorf("start consume: %w", err)
 	}
 	defer cc.Stop()
+
+	// Funding is account state, not an intent, so it rides its own clock rather
+	// than the intent consumer. It runs alongside the worker; both unwind on ctx.
+	go s.pollFunding(ctx)
 
 	for {
 		select {
@@ -344,6 +352,59 @@ func legID(intentID, leg string) string {
 	return intentID + "-" + leg
 }
 
+// pollFunding periodically asks the exchange for funding credited since the last
+// poll and emits each settlement as a durable exec.funding.received fact. It is
+// stateless about positions — like the rest of order-service, which forgets
+// state across restarts — so it emits whenever the exchange reports funding;
+// portfolio attaches it to the open position and drops it when flat. `since`
+// advances past the newest settlement seen so a payment is emitted once.
+func (s *service) pollFunding(ctx context.Context) {
+	if s.cfg.FundingPoll <= 0 {
+		s.log.Info("funding polling disabled")
+		return
+	}
+	t := time.NewTicker(s.cfg.FundingPoll)
+	defer t.Stop()
+	since := time.Now().UTC()
+	s.log.Info("polling funding", "every", s.cfg.FundingPoll, "symbol", s.cfg.Symbol)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			payments, err := s.ex.Funding(ctx, s.cfg.Symbol, since)
+			if err != nil {
+				s.log.Warn("poll funding", "err", err)
+				continue
+			}
+			for _, p := range payments {
+				s.emitFunding(ctx, p)
+				if p.Time.After(since) {
+					since = p.Time
+				}
+			}
+		}
+	}
+}
+
+func (s *service) emitFunding(ctx context.Context, p exchange.FundingPayment) {
+	data, err := json.Marshal(events.FundingReceived{
+		PaymentID: p.ID, Symbol: p.Symbol, Amount: p.Amount, Time: p.Time,
+	})
+	if err != nil {
+		s.log.Error("marshal funding", "id", p.ID, "err", err)
+		return
+	}
+	// Dedup on the settlement id so a redelivered or re-emitted payment is
+	// published once within the window; portfolio's ledger backstops it durably.
+	if _, err := s.js.Publish(ctx, events.SubjFundingReceived, data, jetstream.WithMsgID(p.ID)); err != nil {
+		s.log.Error("publish funding", "id", p.ID, "err", err)
+		return
+	}
+	s.log.Info("funding received", "id", p.ID, "symbol", p.Symbol, "amount", p.Amount)
+}
+
 func (s *service) emitOpened(ctx context.Context, in events.Intent, spot, perp *exchange.OrderResult) {
 	s.emit(ctx, events.SubjPositionOpened, events.ExecReport{
 		IntentID: in.ID, Symbol: in.Symbol, Side: in.Side, Qty: s.qty(),
@@ -403,6 +464,17 @@ func (s *service) qty() float64 {
 func getenv(key, def string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
+	}
+	return def
+}
+
+// getdur parses a Go duration (e.g. "30s", "1m"); a missing or malformed value
+// falls back to def, so a typo degrades to the default rather than crashing.
+func getdur(key string, def time.Duration) time.Duration {
+	if v := os.Getenv(key); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			return d
+		}
 	}
 	return def
 }

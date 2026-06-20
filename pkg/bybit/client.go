@@ -113,6 +113,15 @@ func (c *Client) PlaceOrder(ctx context.Context, req exchange.OrderRequest) (*ex
 	return &res, nil
 }
 
+// Funding is a stub: real funding history needs a signed GET to
+// /v5/account/transaction-log (type=SETTLEMENT), but this client only speaks
+// signed POST, and bybit is a rudiment behind the interface after the pivot.
+// Reporting no funding keeps the contract satisfied without inflating P&L —
+// the same "left until a follow-up query" treatment as PlaceOrder's fill data.
+func (c *Client) Funding(_ context.Context, _ string, _ time.Time) ([]exchange.FundingPayment, error) {
+	return nil, nil
+}
+
 // Classify maps a PlaceOrder error onto an exchange.ErrorKind. A non-APIError is a
 // transport blip (transient); duplicate orderLinkId, regulatory bans, and
 // insufficient balance are pinned by code with a message fallback, since Bybit's

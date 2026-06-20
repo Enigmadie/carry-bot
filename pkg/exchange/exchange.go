@@ -4,7 +4,10 @@
 // in order-service — an Exchange only places one order and classifies its errors.
 package exchange
 
-import "context"
+import (
+	"context"
+	"time"
+)
 
 const (
 	CategorySpot   = "spot"
@@ -46,7 +49,23 @@ const (
 	ErrTransient                  // transport blip → redelivery may succeed
 )
 
+// FundingPayment is one funding settlement credited to the account: a signed
+// amount in quote currency (positive = received by us) tagged with the exchange's
+// own settlement id. Downstream dedupes on ID so a redelivered payment is never
+// counted twice — funding is the bot's actual revenue, so double-booking would
+// inflate P&L.
+type FundingPayment struct {
+	ID     string    // exchange settlement id; idempotency key
+	Symbol string    // instrument the funding settled on
+	Amount float64   // quote currency, signed: positive = received
+	Time   time.Time // settlement time
+}
+
 type Exchange interface {
 	PlaceOrder(ctx context.Context, req OrderRequest) (*OrderResult, error)
 	Classify(err error) ErrorKind
+	// Funding returns settlements credited since `since` (exclusive), oldest
+	// first. An empty slice means nothing new — the common case between the
+	// exchange's funding intervals.
+	Funding(ctx context.Context, symbol string, since time.Time) ([]FundingPayment, error)
 }

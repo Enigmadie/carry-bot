@@ -8,8 +8,10 @@ package mock
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strconv"
 	"sync"
+	"time"
 
 	"github.com/Enigmadie/carry-bot/pkg/exchange"
 )
@@ -22,6 +24,16 @@ const (
 	mockFeeRate = 0.0005
 )
 
+// Synthetic funding. We hold the perp short, so a positive funding rate credits
+// us — each poll books one settlement at this rate over a nominal notional, so
+// P&L drifts the right way (up) over time. The mock keeps no position, so it
+// emits funding unconditionally; portfolio attaches it to the open position and
+// drops it when flat.
+const (
+	mockFundingRate = 0.0001 // 0.01% per settlement
+	mockFundingQty  = 0.001  // nominal base-coin notional for the synthetic accrual
+)
+
 var (
 	errDuplicate = errors.New("mock: duplicate orderLinkId")
 	errInjected  = errors.New("mock: injected leg failure")
@@ -30,8 +42,9 @@ var (
 type Exchange struct {
 	failCategory string // CategorySpot | CategoryLinear | "" — leg to fail, for rollback testing
 
-	mu   sync.Mutex
-	seen map[string]string // orderLinkId -> orderId
+	mu       sync.Mutex
+	seen     map[string]string // orderLinkId -> orderId
+	fundingN int               // monotonic settlement counter, for deterministic ids
 }
 
 // New builds a mock. failCategory ("spot"/"linear"/"") forces that leg to fail
@@ -60,6 +73,22 @@ func (m *Exchange) PlaceOrder(_ context.Context, req exchange.OrderRequest) (*ex
 		Fee:         qty * mockPrice * mockFeeRate,
 		FilledQty:   qty,
 	}, nil
+}
+
+// Funding returns one synthetic settlement per call, timestamped now (so it is
+// always after `since`) with a monotonic id. The amount is a fixed positive
+// credit (perp short receives positive funding), so portfolio's funding_total —
+// and thus P&L — climbs across polls.
+func (m *Exchange) Funding(_ context.Context, symbol string, _ time.Time) ([]exchange.FundingPayment, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.fundingN++
+	return []exchange.FundingPayment{{
+		ID:     fmt.Sprintf("mock-funding-%d", m.fundingN),
+		Symbol: symbol,
+		Amount: mockFundingQty * mockPrice * mockFundingRate,
+		Time:   time.Now().UTC(),
+	}}, nil
 }
 
 func (m *Exchange) Classify(err error) exchange.ErrorKind {

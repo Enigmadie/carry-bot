@@ -79,3 +79,14 @@ type ExecReport struct {
 	Error       string    `json:"error,omitempty"` // set on SubjExecFailed
 	Time        time.Time `json:"time"`
 }
+
+// FundingReceived is a fact emitted by order-service when the exchange credits a
+// funding settlement, published on SubjFundingReceived. PaymentID is the
+// exchange's settlement id; portfolio dedupes on it so a redelivered payment is
+// booked once. Amount is signed quote currency (positive = received).
+type FundingReceived struct {
+	PaymentID string    `json:"payment_id"`
+	Symbol    string    `json:"symbol"`
+	Amount    float64   `json:"amount"`
+	Time      time.Time `json:"time"`
+}
