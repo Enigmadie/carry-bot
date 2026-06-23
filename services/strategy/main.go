@@ -18,8 +18,11 @@ import (
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 	"github.com/nats-io/nuid"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 
 	"github.com/Enigmadie/carry-bot/pkg/events"
+	"github.com/Enigmadie/carry-bot/pkg/metrics"
 )
 
 const (
@@ -27,11 +30,27 @@ const (
 	streamMaxAge = 72 * time.Hour
 )
 
+var (
+	intentsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metrics.Namespace, Subsystem: "strategy",
+		Name: "intents_total", Help: "Intents published to JetStream, by side (open|close).",
+	}, []string{"side"})
+	stateGauge = promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: metrics.Namespace, Subsystem: "strategy",
+		Name: "state", Help: "Position state machine: 0 flat, 1 open.",
+	})
+	publishErrors = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: metrics.Namespace, Subsystem: "strategy",
+		Name: "publish_errors_total", Help: "Intent publishes that failed their JetStream ack.",
+	})
+)
+
 type config struct {
 	NATSURL        string
 	Symbol         string
 	EntryThreshold float64 // open when funding >= this (fraction: 0.0001 = 0.01%)
 	ExitThreshold  float64 // close when funding <= this; keep ExitThreshold < EntryThreshold
+	MetricsAddr    string
 }
 
 func loadConfig() config {
@@ -40,6 +59,7 @@ func loadConfig() config {
 		Symbol:         getenv("SYMBOL", "BTCUSDT"),
 		EntryThreshold: getfloat("ENTRY_THRESHOLD", 0.0001),
 		ExitThreshold:  getfloat("EXIT_THRESHOLD", 0.00005),
+		MetricsAddr:    getenv("METRICS_ADDR", ":2113"),
 	}
 }
 
@@ -89,6 +109,8 @@ func main() {
 	}
 	defer nc.Drain()
 	log.Info("connected to NATS", "url", cfg.NATSURL)
+
+	metrics.Serve(ctx, cfg.MetricsAddr, log)
 
 	// jetstream.New is the current API (the old nc.JetStream() is legacy).
 	js, err := jetstream.New(nc)
@@ -225,15 +247,19 @@ func (s *service) emit(ctx context.Context, subj, side, reason string, fr events
 
 	ack, err := s.js.Publish(ctx, subj, data, jetstream.WithMsgID(intent.ID))
 	if err != nil {
+		publishErrors.Inc()
 		s.log.Error("publish intent", "side", side, "err", err)
 		return // state unchanged → retried on the next funding tick
 	}
 
 	if side == events.IntentOpen {
 		s.state = open
+		stateGauge.Set(1)
 	} else {
 		s.state = flat
+		stateGauge.Set(0)
 	}
+	intentsTotal.WithLabelValues(side).Inc()
 	s.log.Info("intent published",
 		"side", side, "reason", reason, "id", intent.ID,
 		"stream", ack.Stream, "seq", ack.Sequence)

@@ -18,8 +18,11 @@ import (
 	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
 	"github.com/nats-io/nats.go"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 
 	"github.com/Enigmadie/carry-bot/pkg/events"
+	"github.com/Enigmadie/carry-bot/pkg/metrics"
 )
 
 const (
@@ -27,11 +30,31 @@ const (
 	reconnectDelay = 3 * time.Second
 )
 
+var (
+	ticksTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metrics.Namespace, Subsystem: "market",
+		Name: "ticks_total", Help: "Market ticks republished onto NATS, by kind (perp|spot|funding).",
+	}, []string{"kind"})
+	lastPrice = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: metrics.Namespace, Subsystem: "market",
+		Name: "last_price", Help: "Most recent price seen, by instrument.",
+	}, []string{"instrument"})
+	fundingRate = promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: metrics.Namespace, Subsystem: "market",
+		Name: "funding_rate", Help: "Most recent predicted funding rate (fraction).",
+	})
+	wsReconnects = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: metrics.Namespace, Subsystem: "market",
+		Name: "ws_reconnects_total", Help: "WebSocket reconnects across all feeds.",
+	})
+)
+
 type config struct {
 	NATSURL     string
 	LinearWSURL string
 	SpotWSURL   string
 	Symbol      string
+	MetricsAddr string
 }
 
 func loadConfig() config {
@@ -40,6 +63,7 @@ func loadConfig() config {
 		LinearWSURL: getenv("BYBIT_WS_PUBLIC_LINEAR", "wss://stream-testnet.bybit.com/v5/public/linear"),
 		SpotWSURL:   getenv("BYBIT_WS_PUBLIC_SPOT", "wss://stream-testnet.bybit.com/v5/public/spot"),
 		Symbol:      getenv("SYMBOL", "BTCUSDT"),
+		MetricsAddr: getenv("METRICS_ADDR", ":2112"),
 	}
 }
 
@@ -68,6 +92,8 @@ func main() {
 	}
 	defer nc.Drain()
 	log.Info("connected to NATS", "url", cfg.NATSURL)
+
+	metrics.Serve(ctx, cfg.MetricsAddr, log)
 
 	s := &service{log: log, nc: nc, cfg: cfg, ws: &http.Client{}}
 
@@ -109,6 +135,7 @@ func (s *service) runStream(ctx context.Context, url, topic string, handle func(
 		if ctx.Err() != nil {
 			return ctx.Err() // shutting down — not an error
 		}
+		wsReconnects.Inc()
 		s.log.Warn("stream dropped, reconnecting", "topic", topic, "err", err)
 		select {
 		case <-ctx.Done():
@@ -177,17 +204,18 @@ type tickerMessage struct {
 }
 
 func (s *service) handlePerpTicker(raw []byte) error {
-	return s.handleTicker(raw, events.SubjPricePerp, true)
+	return s.handleTicker(raw, events.SubjPricePerp, "perp", true)
 }
 
 func (s *service) handleSpotTicker(raw []byte) error {
-	return s.handleTicker(raw, events.SubjPriceSpot, false)
+	return s.handleTicker(raw, events.SubjPriceSpot, "spot", false)
 }
 
 // handleTicker parses a Bybit tickers payload and republishes the price to
-// priceSubj. Only the perp feed carries a funding rate, so withFunding gates
-// the funding publish; spot tickers never include one.
-func (s *service) handleTicker(raw []byte, priceSubj string, withFunding bool) error {
+// priceSubj. instrument ("perp"|"spot") labels the metrics. Only the perp feed
+// carries a funding rate, so withFunding gates the funding publish; spot tickers
+// never include one.
+func (s *service) handleTicker(raw []byte, priceSubj, instrument string, withFunding bool) error {
 	var msg tickerMessage
 	if err := json.Unmarshal(raw, &msg); err != nil {
 		return fmt.Errorf("unmarshal: %w", err)
@@ -208,6 +236,8 @@ func (s *service) handleTicker(raw []byte, priceSubj string, withFunding bool) e
 			return fmt.Errorf("lastPrice %q: %w", msg.Data.LastPrice, err)
 		}
 		s.publish(priceSubj, events.Price{Symbol: symbol, Price: price, Time: now})
+		ticksTotal.WithLabelValues(instrument).Inc()
+		lastPrice.WithLabelValues(instrument).Set(price)
 	}
 
 	if withFunding && msg.Data.FundingRate != "" {
@@ -220,6 +250,8 @@ func (s *service) handleTicker(raw []byte, priceSubj string, withFunding bool) e
 			fr.NextSettleAt = time.UnixMilli(ms).UTC()
 		}
 		s.publish(events.SubjFundingPredicted, fr)
+		ticksTotal.WithLabelValues("funding").Inc()
+		fundingRate.Set(rate)
 	}
 	return nil
 }

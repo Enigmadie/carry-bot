@@ -22,8 +22,11 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 
 	"github.com/Enigmadie/carry-bot/pkg/events"
+	"github.com/Enigmadie/carry-bot/pkg/metrics"
 )
 
 const (
@@ -32,6 +35,26 @@ const (
 	execMaxAge  = 72 * time.Hour
 	ackWait     = 30 * time.Second
 	maxDeliver  = 5
+
+	// metricsRefresh is how often the ledger aggregates are re-queried into the
+	// gauges. The values come from Postgres, not in-memory counters, so they stay
+	// correct across a restart instead of resetting to zero.
+	metricsRefresh = 15 * time.Second
+)
+
+var (
+	openPositions = promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: metrics.Namespace, Subsystem: "portfolio",
+		Name: "positions_open", Help: "Positions currently open in the ledger.",
+	})
+	realizedPnL = promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: metrics.Namespace, Subsystem: "portfolio",
+		Name: "realized_pnl_total", Help: "Sum of realized P&L over closed positions, quote currency.",
+	})
+	fundingTotal = promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: metrics.Namespace, Subsystem: "portfolio",
+		Name: "funding_total", Help: "Sum of all booked funding settlements, quote currency.",
+	})
 )
 
 const schema = `
@@ -67,12 +90,14 @@ CREATE TABLE IF NOT EXISTS funding_payments (
 type config struct {
 	NATSURL     string
 	DatabaseURL string
+	MetricsAddr string
 }
 
 func loadConfig() config {
 	return config{
 		NATSURL:     getenv("NATS_URL", nats.DefaultURL),
 		DatabaseURL: getenv("DATABASE_URL", "postgres://postgres:postgres@127.0.0.1:5555/carrybot"),
+		MetricsAddr: getenv("METRICS_ADDR", ":2115"),
 	}
 }
 
@@ -107,6 +132,8 @@ func main() {
 	}
 	defer nc.Drain()
 	log.Info("connected to NATS", "url", cfg.NATSURL)
+
+	metrics.Serve(ctx, cfg.MetricsAddr, log)
 
 	js, err := jetstream.New(nc)
 	if err != nil {
@@ -147,6 +174,10 @@ func (s *service) run(ctx context.Context) error {
 	}
 	s.log.Info("consuming exec facts", "stream", execStream, "durable", durableName)
 
+	// Ledger gauges are sourced from Postgres, not the event handlers, so they
+	// survive a restart. Refresh on its own clock alongside the consume loop.
+	go s.refreshMetrics(ctx)
+
 	msgs := make(chan jetstream.Msg, 16)
 	cc, err := cons.Consume(func(m jetstream.Msg) { msgs <- m })
 	if err != nil {
@@ -162,6 +193,49 @@ func (s *service) run(ctx context.Context) error {
 			s.handle(ctx, m)
 		}
 	}
+}
+
+// refreshMetrics re-queries the ledger aggregates into the gauges on a ticker,
+// once at startup and then every metricsRefresh, until ctx is cancelled.
+func (s *service) refreshMetrics(ctx context.Context) {
+	t := time.NewTicker(metricsRefresh)
+	defer t.Stop()
+	for {
+		s.scrapeMetrics(ctx)
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+	}
+}
+
+// scrapeMetrics reads the three ledger aggregates and sets the gauges. A query
+// error leaves the last good value in place rather than zeroing a gauge.
+func (s *service) scrapeMetrics(ctx context.Context) {
+	var open int
+	if err := s.pool.QueryRow(ctx,
+		`SELECT count(*) FROM positions WHERE status = 'open'`).Scan(&open); err != nil {
+		s.log.Warn("metrics: open positions", "err", err)
+		return
+	}
+	openPositions.Set(float64(open))
+
+	var pnl float64
+	if err := s.pool.QueryRow(ctx,
+		`SELECT COALESCE(SUM(realized_pnl), 0) FROM positions WHERE status = 'closed'`).Scan(&pnl); err != nil {
+		s.log.Warn("metrics: realized pnl", "err", err)
+		return
+	}
+	realizedPnL.Set(pnl)
+
+	var funding float64
+	if err := s.pool.QueryRow(ctx,
+		`SELECT COALESCE(SUM(amount), 0) FROM funding_payments`).Scan(&funding); err != nil {
+		s.log.Warn("metrics: funding total", "err", err)
+		return
+	}
+	fundingTotal.Set(funding)
 }
 
 func (s *service) handle(ctx context.Context, m jetstream.Msg) {

@@ -32,10 +32,13 @@ import (
 
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 
 	"github.com/Enigmadie/carry-bot/pkg/bybit"
 	"github.com/Enigmadie/carry-bot/pkg/events"
 	"github.com/Enigmadie/carry-bot/pkg/exchange"
+	"github.com/Enigmadie/carry-bot/pkg/metrics"
 	"github.com/Enigmadie/carry-bot/pkg/mock"
 )
 
@@ -54,6 +57,34 @@ const (
 // on rather than thrash the same doomed order.
 var errRetry = errors.New("retry")
 
+var (
+	placeSeconds = promauto.NewHistogram(prometheus.HistogramOpts{
+		Namespace: metrics.Namespace, Subsystem: "order",
+		Name: "place_seconds", Help: "Latency of a single PlaceOrder call to the exchange.",
+		Buckets: prometheus.DefBuckets,
+	})
+	legsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metrics.Namespace, Subsystem: "order",
+		Name: "legs_total", Help: "Order legs by category, side, and result (placed|duplicate|failed).",
+	}, []string{"category", "side", "result"})
+	intentsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metrics.Namespace, Subsystem: "order",
+		Name: "intents_total", Help: "Intents settled, by side and outcome (opened|closed|failed).",
+	}, []string{"side", "outcome"})
+	rollbacksTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: metrics.Namespace, Subsystem: "order",
+		Name: "rollbacks_total", Help: "Spot legs rolled back after a failed perp leg.",
+	})
+	alertsTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: metrics.Namespace, Subsystem: "order",
+		Name: "alerts_total", Help: "Unrecoverable outcomes needing manual intervention.",
+	})
+	fundingReceivedTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: metrics.Namespace, Subsystem: "order",
+		Name: "funding_received_total", Help: "Funding settlements emitted to the EXEC stream.",
+	})
+)
+
 type config struct {
 	NATSURL  string
 	Symbol   string
@@ -66,6 +97,7 @@ type config struct {
 	APIKey      string
 	APISecret   string
 	MockFailLeg string // mock only: category whose leg fails, for rollback testing
+	MetricsAddr string
 }
 
 func loadConfig() config {
@@ -81,6 +113,7 @@ func loadConfig() config {
 		APIKey:      os.Getenv("BYBIT_API_KEY"),
 		APISecret:   os.Getenv("BYBIT_API_SECRET"),
 		MockFailLeg: os.Getenv("MOCK_FAIL_LEG"),
+		MetricsAddr: getenv("METRICS_ADDR", ":2114"),
 	}
 }
 
@@ -127,6 +160,8 @@ func main() {
 	}
 	defer nc.Drain()
 	log.Info("connected to NATS", "url", cfg.NATSURL)
+
+	metrics.Serve(ctx, cfg.MetricsAddr, log)
 
 	js, err := jetstream.New(nc)
 	if err != nil {
@@ -280,6 +315,7 @@ func (s *service) openPosition(ctx context.Context, in events.Intent) error {
 			s.alert(ctx, in, "ROLLBACK FAILED — naked spot long, manual intervention required: "+rbErr.Error())
 			return nil
 		}
+		rollbacksTotal.Inc()
 		s.emitFailed(ctx, in, "perp leg failed, spot rolled back: "+err.Error())
 		return nil
 	}
@@ -330,15 +366,20 @@ func (s *service) closePosition(ctx context.Context, in events.Intent) error {
 // already placed this exact leg, so we treat it as success (idempotent replay)
 // rather than an error.
 func (s *service) placeLeg(ctx context.Context, in events.Intent, req exchange.OrderRequest) (*exchange.OrderResult, error) {
+	start := time.Now()
 	res, err := s.ex.PlaceOrder(ctx, req)
+	placeSeconds.Observe(time.Since(start).Seconds())
 	if err != nil {
 		if s.ex.Classify(err) == exchange.ErrDuplicate {
+			legsTotal.WithLabelValues(req.Category, req.Side, "duplicate").Inc()
 			s.log.Info("leg already placed (idempotent replay)",
 				"id", in.ID, "link", req.OrderLinkID, "category", req.Category)
 			return &exchange.OrderResult{OrderLinkID: req.OrderLinkID}, nil
 		}
+		legsTotal.WithLabelValues(req.Category, req.Side, "failed").Inc()
 		return nil, err
 	}
+	legsTotal.WithLabelValues(req.Category, req.Side, "placed").Inc()
 	s.log.Info("leg placed", "id", in.ID, "category", req.Category,
 		"side", req.Side, "qty", req.Qty, "order_id", res.OrderID)
 	return res, nil
@@ -400,6 +441,7 @@ func (s *service) emitFunding(ctx context.Context, p exchange.FundingPayment) {
 		s.log.Error("publish funding", "id", p.ID, "err", err)
 		return
 	}
+	fundingReceivedTotal.Inc()
 	s.log.Info("funding received", "id", p.ID, "symbol", p.Symbol, "amount", p.Amount)
 }
 
@@ -410,6 +452,7 @@ func (s *service) emitOpened(ctx context.Context, in events.Intent, spot, perp *
 		SpotPrice: spot.Price, PerpPrice: perp.Price, Fee: spot.Fee + perp.Fee,
 		Time: time.Now().UTC(),
 	})
+	intentsTotal.WithLabelValues(in.Side, "opened").Inc()
 	s.log.Info("position opened", "id", in.ID, "reason", in.Reason)
 }
 
@@ -420,6 +463,7 @@ func (s *service) emitClosed(ctx context.Context, in events.Intent, spot, perp *
 		SpotPrice: spot.Price, PerpPrice: perp.Price, Fee: spot.Fee + perp.Fee,
 		Time: time.Now().UTC(),
 	})
+	intentsTotal.WithLabelValues(in.Side, "closed").Inc()
 	s.log.Info("position closed", "id", in.ID, "reason", in.Reason)
 }
 
@@ -428,12 +472,14 @@ func (s *service) emitFailed(ctx context.Context, in events.Intent, reason strin
 		IntentID: in.ID, Symbol: in.Symbol, Side: in.Side, Qty: s.qty(),
 		Error: reason, Time: time.Now().UTC(),
 	})
+	intentsTotal.WithLabelValues(in.Side, "failed").Inc()
 }
 
 // alert is a failure we cannot resolve automatically. Until notification-service
 // exists the alert is a loud log plus a durable exec.failed fact, which is
 // enough to wake someone via a Grafana/Prometheus alert later.
 func (s *service) alert(ctx context.Context, in events.Intent, reason string) {
+	alertsTotal.Inc()
 	s.log.Error("ALERT", "id", in.ID, "reason", reason)
 	s.emitFailed(ctx, in, reason)
 }
