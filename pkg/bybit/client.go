@@ -17,7 +17,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -37,40 +36,15 @@ type Client struct {
 }
 
 // New builds a client. recvWindow caps server-clock drift before Bybit rejects a
-// request, so clocks matter on the deploy box. bindAddr selects the outbound
-// source IP; "" uses the default route.
-func New(baseURL, apiKey, apiSecret, bindAddr string) (*Client, error) {
-	hc, err := BoundHTTPClient(bindAddr, 10*time.Second)
-	if err != nil {
-		return nil, err
-	}
+// request, so clocks matter on the deploy box.
+func New(baseURL, apiKey, apiSecret string) (*Client, error) {
 	return &Client{
-		http:       hc,
+		http:       &http.Client{Timeout: 10 * time.Second},
 		baseURL:    strings.TrimRight(baseURL, "/"),
 		apiKey:     apiKey,
 		apiSecret:  apiSecret,
 		recvWindow: "5000",
 	}, nil
-}
-
-// BoundHTTPClient returns an *http.Client whose connections egress from bindAddr;
-// empty bindAddr keeps the default route. Pass timeout 0 for long-lived sockets
-// like WebSockets — a non-zero Timeout caps the whole connection, not the handshake.
-func BoundHTTPClient(bindAddr string, timeout time.Duration) (*http.Client, error) {
-	if bindAddr == "" {
-		return &http.Client{Timeout: timeout}, nil
-	}
-	ip := net.ParseIP(bindAddr)
-	if ip == nil {
-		return nil, fmt.Errorf("invalid bind addr %q", bindAddr)
-	}
-	transport := http.DefaultTransport.(*http.Transport).Clone()
-	transport.DialContext = (&net.Dialer{
-		LocalAddr: &net.TCPAddr{IP: ip},
-		Timeout:   30 * time.Second,
-		KeepAlive: 30 * time.Second,
-	}).DialContext
-	return &http.Client{Timeout: timeout, Transport: transport}, nil
 }
 
 // APIError is a non-zero retCode from Bybit. Classify maps Code to an ErrorKind.

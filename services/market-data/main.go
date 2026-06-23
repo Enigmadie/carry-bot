@@ -19,7 +19,6 @@ import (
 	"github.com/coder/websocket/wsjson"
 	"github.com/nats-io/nats.go"
 
-	"github.com/Enigmadie/carry-bot/pkg/bybit"
 	"github.com/Enigmadie/carry-bot/pkg/events"
 )
 
@@ -33,7 +32,6 @@ type config struct {
 	LinearWSURL string
 	SpotWSURL   string
 	Symbol      string
-	BindAddr    string // source IP for Bybit WS traffic; "" = default route
 }
 
 func loadConfig() config {
@@ -42,7 +40,6 @@ func loadConfig() config {
 		LinearWSURL: getenv("BYBIT_WS_PUBLIC_LINEAR", "wss://stream-testnet.bybit.com/v5/public/linear"),
 		SpotWSURL:   getenv("BYBIT_WS_PUBLIC_SPOT", "wss://stream-testnet.bybit.com/v5/public/spot"),
 		Symbol:      getenv("SYMBOL", "BTCUSDT"),
-		BindAddr:    os.Getenv("BYBIT_BIND_ADDR"),
 	}
 }
 
@@ -50,8 +47,8 @@ type service struct {
 	log *slog.Logger
 	nc  *nats.Conn
 	cfg config
-	// ws dials the Bybit WebSocket; its source IP is bound to cfg.BindAddr.
-	// Timeout 0 — a WebSocket outlives any request clock.
+	// ws dials the public WebSocket. Timeout 0 — a WebSocket outlives any
+	// request clock.
 	ws *http.Client
 }
 
@@ -72,13 +69,7 @@ func main() {
 	defer nc.Drain()
 	log.Info("connected to NATS", "url", cfg.NATSURL)
 
-	wsClient, err := bybit.BoundHTTPClient(cfg.BindAddr, 0)
-	if err != nil {
-		log.Error("build ws client", "err", err)
-		os.Exit(1)
-	}
-
-	s := &service{log: log, nc: nc, cfg: cfg, ws: wsClient}
+	s := &service{log: log, nc: nc, cfg: cfg, ws: &http.Client{}}
 
 	// Two independent feeds, one WebSocket each. The linear (perp) tickers
 	// stream carries the perp price and the predicted funding rate; the spot

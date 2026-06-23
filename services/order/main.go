@@ -65,7 +65,6 @@ type config struct {
 	BybitREST   string
 	APIKey      string
 	APISecret   string
-	BindAddr    string // source IP for Bybit traffic; "" = default route
 	MockFailLeg string // mock only: category whose leg fails, for rollback testing
 }
 
@@ -81,7 +80,6 @@ func loadConfig() config {
 		BybitREST:   getenv("BYBIT_REST", bybit.TestnetREST),
 		APIKey:      os.Getenv("BYBIT_API_KEY"),
 		APISecret:   os.Getenv("BYBIT_API_SECRET"),
-		BindAddr:    os.Getenv("BYBIT_BIND_ADDR"),
 		MockFailLeg: os.Getenv("MOCK_FAIL_LEG"),
 	}
 }
@@ -103,7 +101,7 @@ func buildExchange(cfg config) (exchange.Exchange, error) {
 		if cfg.APIKey == "" || cfg.APISecret == "" {
 			return nil, errors.New("EXCHANGE=bybit requires BYBIT_API_KEY and BYBIT_API_SECRET")
 		}
-		return bybit.New(cfg.BybitREST, cfg.APIKey, cfg.APISecret, cfg.BindAddr)
+		return bybit.New(cfg.BybitREST, cfg.APIKey, cfg.APISecret)
 	default:
 		return nil, fmt.Errorf("unknown EXCHANGE provider %q", cfg.Provider)
 	}
