@@ -15,6 +15,10 @@ type metaResp struct {
 	} `json:"universe"`
 }
 
+// spotAssetOffset separates spot from perp asset ids: perps and spot share the
+// order `a` field, so a spot asset's id is this offset plus its universe index.
+const spotAssetOffset = 10000
+
 // spotMetaResp is the /info "spotMeta" reply. A spot asset's order index is
 // 10000 + its universe index (perps and spot share the `a` field). The pair's
 // size precision comes from its base token, listed separately in Tokens.
@@ -85,7 +89,7 @@ func buildSpotAssets(m spotMetaResp) map[string]assetRef {
 		if len(u.Tokens) > 0 {
 			sz = tokenSz[u.Tokens[0]]
 		}
-		out["spot:"+base] = assetRef{Asset: 10000 + u.Index, SzDecimals: sz}
+		out["spot:"+base] = assetRef{Asset: spotAssetOffset + u.Index, SzDecimals: sz}
 	}
 	return out
 }

@@ -40,6 +40,7 @@ type Config struct {
 	Mainnet    bool   // phantom-agent source: true = "a", false = "b"
 	PrivateKey string // agent-wallet signing key; empty = no signed actions
 	Vault      string // optional sub-account/vault address; "" = trade as self
+	Account    string // master account for user queries (funding/fills); "" → derived
 }
 
 type Client struct {
@@ -48,6 +49,7 @@ type Client struct {
 	mainnet bool
 	key     *ecdsa.PrivateKey   // nil if no signing key was provided
 	vault   *common.Address     // nil = trade as self
+	account common.Address      // address user queries target (funding/fills)
 	mu      sync.RWMutex        // guards the asset maps, refreshable at runtime
 	assets  map[string]assetRef // key: "<category>:<symbol>", e.g. "linear:BTCUSDT"
 }
@@ -85,6 +87,22 @@ func New(cfg Config) (*Client, error) {
 		}
 		addr := common.HexToAddress(cfg.Vault)
 		c.vault = &addr
+	}
+
+	// account for user queries (funding/fills): an explicit master address wins;
+	// otherwise the vault, otherwise the signing key's own address. The fallback is
+	// correct only when the key IS the account key — with a separate agent wallet
+	// the master differs, so Account must be set or funding queries come back empty.
+	switch {
+	case cfg.Account != "":
+		if !common.IsHexAddress(cfg.Account) {
+			return nil, fmt.Errorf("invalid account address %q", cfg.Account)
+		}
+		c.account = common.HexToAddress(cfg.Account)
+	case c.vault != nil:
+		c.account = *c.vault
+	case c.key != nil:
+		c.account = crypto.PubkeyToAddress(c.key.PublicKey)
 	}
 
 	return c, nil
