@@ -27,6 +27,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -38,6 +39,7 @@ import (
 	"github.com/Enigmadie/carry-bot/pkg/bybit"
 	"github.com/Enigmadie/carry-bot/pkg/events"
 	"github.com/Enigmadie/carry-bot/pkg/exchange"
+	"github.com/Enigmadie/carry-bot/pkg/hyperliquid"
 	"github.com/Enigmadie/carry-bot/pkg/metrics"
 	"github.com/Enigmadie/carry-bot/pkg/mock"
 )
@@ -88,7 +90,7 @@ var (
 type config struct {
 	NATSURL  string
 	Symbol   string
-	Provider string // EXCHANGE: mock | bybit
+	Provider string // EXCHANGE: mock | bybit | hyperliquid
 	OrderQty string // base-coin amount per leg; intents carry no size
 
 	FundingPoll time.Duration // how often to poll the exchange for funding; 0 disables
@@ -97,6 +99,13 @@ type config struct {
 	APIKey      string
 	APISecret   string
 	MockFailLeg string // mock only: category whose leg fails, for rollback testing
+
+	HLAPI        string // hyperliquid REST host; "" → testnet
+	HLMainnet    bool   // hyperliquid: phantom-agent source; must match HLAPI
+	HLPrivateKey string // hyperliquid agent-wallet signing key
+	HLVault      string // hyperliquid: optional vault/sub-account address
+	HLAccount    string // hyperliquid: master account for funding queries
+
 	MetricsAddr string
 }
 
@@ -113,6 +122,13 @@ func loadConfig() config {
 		APIKey:      os.Getenv("BYBIT_API_KEY"),
 		APISecret:   os.Getenv("BYBIT_API_SECRET"),
 		MockFailLeg: os.Getenv("MOCK_FAIL_LEG"),
+
+		HLAPI:        os.Getenv("HL_API"),
+		HLMainnet:    getbool("HL_MAINNET", false),
+		HLPrivateKey: os.Getenv("HL_PRIVATE_KEY"),
+		HLVault:      os.Getenv("HL_VAULT"),
+		HLAccount:    os.Getenv("HL_ACCOUNT"),
+
 		MetricsAddr: getenv("METRICS_ADDR", ":2114"),
 	}
 }
@@ -125,8 +141,10 @@ type service struct {
 }
 
 // buildExchange selects the provider from config. mock-first: the default needs no
-// keys or network, so `make order` runs locally; bybit is opt-in via EXCHANGE.
-func buildExchange(cfg config) (exchange.Exchange, error) {
+// keys or network, so `make order` runs locally; bybit and hyperliquid are opt-in
+// via EXCHANGE. ctx is threaded in only for hyperliquid, which must reach the
+// exchange at startup to resolve its numeric asset ids (see the case below).
+func buildExchange(ctx context.Context, cfg config) (exchange.Exchange, error) {
 	switch cfg.Provider {
 	case "mock":
 		return mock.New(cfg.MockFailLeg), nil
@@ -135,6 +153,28 @@ func buildExchange(cfg config) (exchange.Exchange, error) {
 			return nil, errors.New("EXCHANGE=bybit requires BYBIT_API_KEY and BYBIT_API_SECRET")
 		}
 		return bybit.New(cfg.BybitREST, cfg.APIKey, cfg.APISecret)
+	case "hyperliquid":
+		if cfg.HLPrivateKey == "" {
+			return nil, errors.New("EXCHANGE=hyperliquid requires HL_PRIVATE_KEY")
+		}
+		c, err := hyperliquid.New(hyperliquid.Config{
+			BaseURL:    cfg.HLAPI,
+			Mainnet:    cfg.HLMainnet,
+			PrivateKey: cfg.HLPrivateKey,
+			Vault:      cfg.HLVault,
+			Account:    cfg.HLAccount,
+		})
+		if err != nil {
+			return nil, err
+		}
+		// Hyperliquid addresses instruments by a numeric asset id, not a symbol, so
+		// the client can't place an order until it has loaded exchange metadata. The
+		// Exchange interface has no such step, so we do it here, behind the provider
+		// switch, before handing the client back ready to trade.
+		if err := c.LoadMeta(ctx); err != nil {
+			return nil, fmt.Errorf("load hyperliquid meta: %w", err)
+		}
+		return c, nil
 	default:
 		return nil, fmt.Errorf("unknown EXCHANGE provider %q", cfg.Provider)
 	}
@@ -144,14 +184,16 @@ func main() {
 	log := slog.New(slog.NewTextHandler(os.Stdout, nil))
 	cfg := loadConfig()
 
-	ex, err := buildExchange(cfg)
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	// Built under ctx because hyperliquid loads exchange metadata over the network
+	// here; a shutdown signal during startup cancels it instead of hanging.
+	ex, err := buildExchange(ctx, cfg)
 	if err != nil {
 		log.Error("build exchange", "err", err)
 		os.Exit(1)
 	}
-
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
 
 	nc, err := nats.Connect(cfg.NATSURL)
 	if err != nil {
@@ -521,4 +563,18 @@ func getdur(key string, def time.Duration) time.Duration {
 		}
 	}
 	return def
+}
+
+// getbool parses a bool env (1/true/yes and their negatives, case-insensitive);
+// a missing or malformed value falls back to def. HL_MAINNET must match HL_API,
+// so the safe default is testnet (false).
+func getbool(key string, def bool) bool {
+	switch strings.ToLower(os.Getenv(key)) {
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	default:
+		return def
+	}
 }
