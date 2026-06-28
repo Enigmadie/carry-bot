@@ -1,5 +1,12 @@
-// Command market-data connects to Bybit's public WebSocket and republishes
-// perp prices and funding rates onto NATS for the rest of the system.
+// Command market-data connects to Hyperliquid's public WebSocket and republishes
+// perp/spot prices and the perp funding rate onto NATS for the rest of the system.
+//
+// Hyperliquid multiplexes feeds as named channels over a single socket, unlike
+// Bybit's one-subscription-per-connection model: we open one WebSocket and
+// subscribe to allMids (mid prices for every instrument, keyed by coin for perps
+// and "@<index>" for spot) and activeAssetCtx (per-coin context carrying the
+// funding rate). Hyperliquid keys spot mids by a numeric index, so the instrument
+// keys are resolved once at startup from /info metadata (see pkg/hyperliquid).
 package main
 
 import (
@@ -11,7 +18,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
-	"sync"
+	"strings"
 	"syscall"
 	"time"
 
@@ -22,12 +29,17 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promauto"
 
 	"github.com/Enigmadie/carry-bot/pkg/events"
+	"github.com/Enigmadie/carry-bot/pkg/hyperliquid"
 	"github.com/Enigmadie/carry-bot/pkg/metrics"
 )
 
 const (
+	// Hyperliquid drops an idle socket after ~60s; ping well inside that window.
 	pingInterval   = 15 * time.Second
 	reconnectDelay = 3 * time.Second
+
+	mainnetWS = "wss://api.hyperliquid.xyz/ws"
+	testnetWS = "wss://api.hyperliquid-testnet.xyz/ws"
 )
 
 var (
@@ -51,20 +63,30 @@ var (
 
 type config struct {
 	NATSURL     string
-	LinearWSURL string
-	SpotWSURL   string
+	WSURL       string
+	Mainnet     bool   // selects default WS/REST host; matches order-service's HL_MAINNET
+	RESTURL     string // /info host for metadata; "" → testnet
 	Symbol      string
 	MetricsAddr string
 }
 
 func loadConfig() config {
+	mainnet := getbool("HL_MAINNET", false)
 	return config{
 		NATSURL:     getenv("NATS_URL", nats.DefaultURL),
-		LinearWSURL: getenv("BYBIT_WS_PUBLIC_LINEAR", "wss://stream-testnet.bybit.com/v5/public/linear"),
-		SpotWSURL:   getenv("BYBIT_WS_PUBLIC_SPOT", "wss://stream-testnet.bybit.com/v5/public/spot"),
+		WSURL:       getenv("HL_WS", defaultWSURL(mainnet)),
+		Mainnet:     mainnet,
+		RESTURL:     os.Getenv("HL_API"),
 		Symbol:      getenv("SYMBOL", "BTCUSDT"),
 		MetricsAddr: getenv("METRICS_ADDR", ":2112"),
 	}
+}
+
+func defaultWSURL(mainnet bool) string {
+	if mainnet {
+		return mainnetWS
+	}
+	return testnetWS
 }
 
 type service struct {
@@ -74,6 +96,11 @@ type service struct {
 	// ws dials the public WebSocket. Timeout 0 — a WebSocket outlives any
 	// request clock.
 	ws *http.Client
+	// Resolved once at startup: the allMids key / activeAssetCtx coin for the perp,
+	// and the allMids key for spot. spotKey is "" when the symbol has no listed
+	// spot pair, in which case we run perp + funding only.
+	coin    string
+	spotKey string
 }
 
 func main() {
@@ -95,48 +122,43 @@ func main() {
 
 	metrics.Serve(ctx, cfg.MetricsAddr, log)
 
-	s := &service{log: log, nc: nc, cfg: cfg, ws: &http.Client{}}
-
-	// Two independent feeds, one WebSocket each. The linear (perp) tickers
-	// stream carries the perp price and the predicted funding rate; the spot
-	// tickers stream carries only the spot price. Both reconnect on their own
-	// and unwind together when the root context is cancelled.
-	topic := "tickers." + cfg.Symbol
-	feeds := []struct {
-		url    string
-		handle func([]byte) error
-	}{
-		{cfg.LinearWSURL, s.handlePerpTicker},
-		{cfg.SpotWSURL, s.handleSpotTicker},
+	// Hyperliquid keys spot mids by a numeric index, so resolve the instrument
+	// keys from /info metadata before subscribing. An info-only client needs no
+	// signing key. ctx-bound so a shutdown during startup cancels rather than hangs.
+	hl, err := hyperliquid.New(hyperliquid.Config{BaseURL: cfg.RESTURL, Mainnet: cfg.Mainnet})
+	if err != nil {
+		log.Error("build hyperliquid client", "err", err)
+		os.Exit(1)
+	}
+	if err := hl.LoadMeta(ctx); err != nil {
+		log.Error("load hyperliquid meta", "err", err)
+		os.Exit(1)
+	}
+	coin, spotKey, spotOK := hl.MarketKeys(cfg.Symbol)
+	if !spotOK {
+		log.Warn("no spot listing for symbol; running perp + funding only", "symbol", cfg.Symbol)
 	}
 
-	var wg sync.WaitGroup
-	for _, f := range feeds {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			// runStream only returns once the context is cancelled, so any
-			// non-context error here is genuinely fatal for this feed.
-			if err := s.runStream(ctx, f.url, topic, f.handle); err != nil && ctx.Err() == nil {
-				log.Error("stream failed", "url", f.url, "err", err)
-				stop() // bring the whole service down rather than run half-blind
-			}
-		}()
+	s := &service{log: log, nc: nc, cfg: cfg, ws: &http.Client{}, coin: coin, spotKey: spotKey}
+
+	// One WebSocket carries both feeds (Hyperliquid multiplexes channels), so a
+	// single reconnect loop owns the connection and unwinds with the root context.
+	if err := s.run(ctx); err != nil && ctx.Err() == nil {
+		log.Error("stream failed", "err", err)
 	}
-	wg.Wait()
 	log.Info("shutdown complete")
 }
 
-// runStream keeps a single WebSocket subscription alive, reconnecting with a
-// fixed delay until the context is cancelled.
-func (s *service) runStream(ctx context.Context, url, topic string, handle func([]byte) error) error {
+// run keeps the single WebSocket alive, reconnecting with a fixed delay until the
+// context is cancelled.
+func (s *service) run(ctx context.Context) error {
 	for {
-		err := s.streamOnce(ctx, url, topic, handle)
+		err := s.streamOnce(ctx)
 		if ctx.Err() != nil {
 			return ctx.Err() // shutting down — not an error
 		}
 		wsReconnects.Inc()
-		s.log.Warn("stream dropped, reconnecting", "topic", topic, "err", err)
+		s.log.Warn("stream dropped, reconnecting", "err", err)
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
@@ -145,21 +167,30 @@ func (s *service) runStream(ctx context.Context, url, topic string, handle func(
 	}
 }
 
-func (s *service) streamOnce(ctx context.Context, url, topic string, handle func([]byte) error) error {
-	c, _, err := websocket.Dial(ctx, url, &websocket.DialOptions{HTTPClient: s.ws})
+func (s *service) streamOnce(ctx context.Context) error {
+	c, _, err := websocket.Dial(ctx, s.cfg.WSURL, &websocket.DialOptions{HTTPClient: s.ws})
 	if err != nil {
 		return fmt.Errorf("dial: %w", err)
 	}
 	defer c.Close(websocket.StatusNormalClosure, "")
 	c.SetReadLimit(1 << 20)
 
-	if err := wsjson.Write(ctx, c, map[string]any{"op": "subscribe", "args": []string{topic}}); err != nil {
-		return fmt.Errorf("subscribe: %w", err)
+	// Subscribe to every feed on this one socket: allMids for prices (all
+	// instruments) and activeAssetCtx for the perp's funding rate. Re-sent on each
+	// (re)connect so a reconnect resubscribes.
+	subs := []map[string]any{
+		{"method": "subscribe", "subscription": map[string]any{"type": "allMids"}},
+		{"method": "subscribe", "subscription": map[string]any{"type": "activeAssetCtx", "coin": s.coin}},
 	}
-	s.log.Info("subscribed", "url", url, "topic", topic)
+	for _, sub := range subs {
+		if err := wsjson.Write(ctx, c, sub); err != nil {
+			return fmt.Errorf("subscribe: %w", err)
+		}
+	}
+	s.log.Info("subscribed", "url", s.cfg.WSURL, "coin", s.coin, "spot", s.spotKey)
 
 	// Ping on a child context so the ping goroutine stops as soon as this
-	// connection does. Bybit drops the socket without a ping every ~20s.
+	// connection does.
 	connCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	go s.pingLoop(connCtx, c)
@@ -169,8 +200,8 @@ func (s *service) streamOnce(ctx context.Context, url, topic string, handle func
 		if err != nil {
 			return fmt.Errorf("read: %w", err)
 		}
-		if err := handle(data); err != nil {
-			s.log.Warn("handle message", "topic", topic, "err", err)
+		if err := s.dispatch(data); err != nil {
+			s.log.Warn("handle message", "err", err)
 		}
 	}
 }
@@ -183,76 +214,101 @@ func (s *service) pingLoop(ctx context.Context, c *websocket.Conn) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			if err := wsjson.Write(ctx, c, map[string]any{"op": "ping"}); err != nil {
+			if err := wsjson.Write(ctx, c, map[string]any{"method": "ping"}); err != nil {
 				return // connection is going away; the read loop will surface it
 			}
 		}
 	}
 }
 
-// tickerMessage is the slice of Bybit's tickers payload we care about. Bybit
-// sends numbers as strings, and after the first snapshot only changed fields
-// are present, so every field is optional.
-type tickerMessage struct {
-	Topic string `json:"topic"`
-	Data  struct {
-		Symbol          string `json:"symbol"`
-		LastPrice       string `json:"lastPrice"`
-		FundingRate     string `json:"fundingRate"`
-		NextFundingTime string `json:"nextFundingTime"`
-	} `json:"data"`
+// wsEnvelope is the outer frame every Hyperliquid WS message shares: a channel
+// name and a channel-specific data payload, left raw until the channel is known.
+type wsEnvelope struct {
+	Channel string          `json:"channel"`
+	Data    json.RawMessage `json:"data"`
 }
 
-func (s *service) handlePerpTicker(raw []byte) error {
-	return s.handleTicker(raw, events.SubjPricePerp, "perp", true)
-}
-
-func (s *service) handleSpotTicker(raw []byte) error {
-	return s.handleTicker(raw, events.SubjPriceSpot, "spot", false)
-}
-
-// handleTicker parses a Bybit tickers payload and republishes the price to
-// priceSubj. instrument ("perp"|"spot") labels the metrics. Only the perp feed
-// carries a funding rate, so withFunding gates the funding publish; spot tickers
-// never include one.
-func (s *service) handleTicker(raw []byte, priceSubj, instrument string, withFunding bool) error {
-	var msg tickerMessage
-	if err := json.Unmarshal(raw, &msg); err != nil {
-		return fmt.Errorf("unmarshal: %w", err)
+// dispatch routes a raw WS frame to its channel handler. Non-data frames
+// (subscriptionResponse, pong) carry nothing to publish and fall through.
+func (s *service) dispatch(raw []byte) error {
+	var env wsEnvelope
+	if err := json.Unmarshal(raw, &env); err != nil {
+		return fmt.Errorf("unmarshal envelope: %w", err)
 	}
-	if msg.Topic == "" {
-		return nil // subscribe ack / pong — nothing to publish
+	switch env.Channel {
+	case "allMids":
+		return s.handleMids(env.Data)
+	case "activeAssetCtx":
+		return s.handleAssetCtx(env.Data)
+	default:
+		return nil
 	}
+}
 
-	symbol := msg.Data.Symbol
-	if symbol == "" {
-		symbol = s.cfg.Symbol
+// midsData is the allMids payload: instrument key → mid price. Hyperliquid sends
+// prices as decimal strings. Perps are keyed by coin ("BTC"), spot by "@<index>".
+type midsData struct {
+	Mids map[string]string `json:"mids"`
+}
+
+func (s *service) handleMids(raw json.RawMessage) error {
+	var d midsData
+	if err := json.Unmarshal(raw, &d); err != nil {
+		return fmt.Errorf("unmarshal mids: %w", err)
 	}
 	now := time.Now().UTC()
-
-	if msg.Data.LastPrice != "" {
-		price, err := strconv.ParseFloat(msg.Data.LastPrice, 64)
-		if err != nil {
-			return fmt.Errorf("lastPrice %q: %w", msg.Data.LastPrice, err)
-		}
-		s.publish(priceSubj, events.Price{Symbol: symbol, Price: price, Time: now})
-		ticksTotal.WithLabelValues(instrument).Inc()
-		lastPrice.WithLabelValues(instrument).Set(price)
+	if px, ok := d.Mids[s.coin]; ok {
+		s.publishPrice(events.SubjPricePerp, "perp", px, now)
 	}
-
-	if withFunding && msg.Data.FundingRate != "" {
-		rate, err := strconv.ParseFloat(msg.Data.FundingRate, 64)
-		if err != nil {
-			return fmt.Errorf("fundingRate %q: %w", msg.Data.FundingRate, err)
+	if s.spotKey != "" {
+		if px, ok := d.Mids[s.spotKey]; ok {
+			s.publishPrice(events.SubjPriceSpot, "spot", px, now)
 		}
-		fr := events.FundingRate{Symbol: symbol, Rate: rate, Time: now}
-		if ms, err := strconv.ParseInt(msg.Data.NextFundingTime, 10, 64); err == nil && ms > 0 {
-			fr.NextSettleAt = time.UnixMilli(ms).UTC()
-		}
-		s.publish(events.SubjFundingPredicted, fr)
-		ticksTotal.WithLabelValues("funding").Inc()
-		fundingRate.Set(rate)
 	}
+	return nil
+}
+
+func (s *service) publishPrice(subj, instrument, raw string, now time.Time) {
+	price, err := strconv.ParseFloat(raw, 64)
+	if err != nil {
+		s.log.Warn("parse price", "instrument", instrument, "value", raw, "err", err)
+		return
+	}
+	s.publish(subj, events.Price{Symbol: s.cfg.Symbol, Price: price, Time: now})
+	ticksTotal.WithLabelValues(instrument).Inc()
+	lastPrice.WithLabelValues(instrument).Set(price)
+}
+
+// assetCtxData is the activeAssetCtx payload. We take only the funding rate; the
+// ctx also carries mark/oracle/mid prices we already get from allMids.
+type assetCtxData struct {
+	Coin string `json:"coin"`
+	Ctx  struct {
+		Funding string `json:"funding"` // funding rate, decimal-string fraction
+	} `json:"ctx"`
+}
+
+func (s *service) handleAssetCtx(raw json.RawMessage) error {
+	var d assetCtxData
+	if err := json.Unmarshal(raw, &d); err != nil {
+		return fmt.Errorf("unmarshal assetCtx: %w", err)
+	}
+	if d.Ctx.Funding == "" {
+		return nil
+	}
+	rate, err := strconv.ParseFloat(d.Ctx.Funding, 64)
+	if err != nil {
+		return fmt.Errorf("funding %q: %w", d.Ctx.Funding, err)
+	}
+	// Hyperliquid funds hourly (Bybit settled every 8h); the rate is per-hour. We
+	// pass it through as-is — the entry/exit thresholds it's compared against are a
+	// strategy-side concern. NextSettleAt is left unset: the ctx carries no next
+	// settlement time, and strategy keys off the rate alone.
+	s.publish(events.SubjFundingPredicted, events.FundingRate{
+		Symbol: s.cfg.Symbol, Rate: rate, Time: time.Now().UTC(),
+	})
+	ticksTotal.WithLabelValues("funding").Inc()
+	fundingRate.Set(rate)
 	return nil
 }
 
@@ -272,4 +328,18 @@ func getenv(key, def string) string {
 		return v
 	}
 	return def
+}
+
+// getbool parses a bool env (1/true/yes/on and their negatives, case-insensitive);
+// a missing or malformed value falls back to def. HL_MAINNET must match the REST
+// host, so the safe default is testnet (false).
+func getbool(key string, def bool) bool {
+	switch strings.ToLower(os.Getenv(key)) {
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	default:
+		return def
+	}
 }

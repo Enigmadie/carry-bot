@@ -75,6 +75,22 @@ func TestResolveAssetUnknown(t *testing.T) {
 	}
 }
 
+func TestMarketKeys(t *testing.T) {
+	c := loadSample(t)
+
+	// BTC has a spot pair (BTC/USDC, index 3) → allMids spot key "@3".
+	coin, spotKey, ok := c.MarketKeys("BTCUSDT")
+	if coin != "BTC" || spotKey != "@3" || !ok {
+		t.Errorf("MarketKeys(BTCUSDT) = (%q, %q, %v), want (BTC, @3, true)", coin, spotKey, ok)
+	}
+
+	// ETH has a perp but no spot pair in the sample → coin resolves, spot does not.
+	coin, spotKey, ok = c.MarketKeys("ETHUSDT")
+	if coin != "ETH" || spotKey != "" || ok {
+		t.Errorf("MarketKeys(ETHUSDT) = (%q, %q, %v), want (ETH, \"\", false)", coin, spotKey, ok)
+	}
+}
+
 func TestStripQuote(t *testing.T) {
 	cases := map[string]string{
 		"BTCUSDT": "BTC",

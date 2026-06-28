@@ -109,6 +109,25 @@ func (c *Client) resolveAsset(category, symbol string) (assetRef, error) {
 	return ref, nil
 }
 
+// MarketKeys resolves the keys a market-data feed needs for a neutral symbol on
+// Hyperliquid's allMids channel: the perp coin (which is also the activeAssetCtx
+// subscription coin) and the spot mid key "@<index>". It mirrors resolveAsset but
+// returns WS-channel keys rather than order asset ids — allMids keys perps by coin
+// name and spot pairs by "@<spotIndex>", where the spot index is the order asset
+// id minus the offset. The perp coin is always available (just the stripped
+// quote); the spot key needs a listed pair (best-effort, see buildSpotAssets), so
+// spotOK is false when none is mapped. Requires LoadMeta first.
+func (c *Client) MarketKeys(symbol string) (coin, spotKey string, spotOK bool) {
+	coin = stripQuote(symbol)
+	c.mu.RLock()
+	ref, ok := c.assets["spot:"+coin]
+	c.mu.RUnlock()
+	if ok {
+		spotKey = fmt.Sprintf("@%d", ref.Asset-spotAssetOffset)
+	}
+	return coin, spotKey, ok
+}
+
 // stripQuote drops a trailing quote-currency suffix so "BTCUSDT" → "BTC". Longest
 // suffix first so "USDT" isn't shadowed by "USD".
 func stripQuote(symbol string) string {
