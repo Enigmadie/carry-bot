@@ -60,11 +60,15 @@ func TestCloidFromLinkID(t *testing.T) {
 
 func TestSlippagePrice(t *testing.T) {
 	mid := 100.0
-	if buy := slippagePrice(mid, true); buy <= mid {
+	if buy := slippagePrice(mid, 0.05, true); buy <= mid {
 		t.Errorf("buy slippage price %v should exceed mid %v", buy, mid)
 	}
-	if sell := slippagePrice(mid, false); sell >= mid {
+	if sell := slippagePrice(mid, 0.05, false); sell >= mid {
 		t.Errorf("sell slippage price %v should be below mid %v", sell, mid)
+	}
+	// A wider slippage pushes the IOC price further past the mid (thin-book case).
+	if wide, narrow := slippagePrice(mid, 0.5, true), slippagePrice(mid, 0.05, true); wide <= narrow {
+		t.Errorf("wider slippage buy %v should exceed narrower %v", wide, narrow)
 	}
 }
 
@@ -119,7 +123,8 @@ func TestClassify(t *testing.T) {
 		{&APIError{Msg: "Insufficient margin to place order"}, exchange.ErrTerminal},
 		{&APIError{Msg: "Order has invalid reduce only flag"}, exchange.ErrTerminal},
 		{&APIError{Msg: "Client order id already used"}, exchange.ErrDuplicate},
-		{&APIError{Msg: "Order could not immediately match against any resting orders"}, exchange.ErrOther},
+		// An IOC that crossed nothing is terminal: retrying the same priced IOC fails again.
+		{&APIError{Msg: "Order could not immediately match against any resting orders"}, exchange.ErrTerminal},
 	}
 	for _, tc := range cases {
 		if got := c.Classify(tc.err); got != tc.want {

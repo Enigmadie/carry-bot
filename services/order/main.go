@@ -100,11 +100,12 @@ type config struct {
 	APISecret   string
 	MockFailLeg string // mock only: category whose leg fails, for rollback testing
 
-	HLAPI        string // hyperliquid REST host; "" → testnet
-	HLMainnet    bool   // hyperliquid: phantom-agent source; must match HLAPI
-	HLPrivateKey string // hyperliquid agent-wallet signing key
-	HLVault      string // hyperliquid: optional vault/sub-account address
-	HLAccount    string // hyperliquid: master account for funding queries
+	HLAPI        string  // hyperliquid REST host; "" → testnet
+	HLMainnet    bool    // hyperliquid: phantom-agent source; must match HLAPI
+	HLPrivateKey string  // hyperliquid agent-wallet signing key
+	HLVault      string  // hyperliquid: optional vault/sub-account address
+	HLAccount    string  // hyperliquid: master account for funding queries
+	HLSlippage   float64 // hyperliquid: IOC price offset past mid; 0 → client default (5%)
 
 	MetricsAddr string
 }
@@ -128,6 +129,7 @@ func loadConfig() config {
 		HLPrivateKey: os.Getenv("HL_PRIVATE_KEY"),
 		HLVault:      os.Getenv("HL_VAULT"),
 		HLAccount:    os.Getenv("HL_ACCOUNT"),
+		HLSlippage:   getfloat("HL_SLIPPAGE", 0),
 
 		MetricsAddr: getenv("METRICS_ADDR", ":2114"),
 	}
@@ -163,6 +165,7 @@ func buildExchange(ctx context.Context, cfg config) (exchange.Exchange, error) {
 			PrivateKey: cfg.HLPrivateKey,
 			Vault:      cfg.HLVault,
 			Account:    cfg.HLAccount,
+			Slippage:   cfg.HLSlippage,
 		})
 		if err != nil {
 			return nil, err
@@ -560,6 +563,17 @@ func getdur(key string, def time.Duration) time.Duration {
 	if v := os.Getenv(key); v != "" {
 		if d, err := time.ParseDuration(v); err == nil {
 			return d
+		}
+	}
+	return def
+}
+
+// getfloat parses a float env (e.g. "0.5"); a missing or malformed value falls
+// back to def, so a typo degrades to the default rather than crashing.
+func getfloat(key string, def float64) float64 {
+	if v := os.Getenv(key); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			return f
 		}
 	}
 	return def

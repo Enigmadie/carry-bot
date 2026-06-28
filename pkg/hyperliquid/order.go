@@ -36,7 +36,10 @@ var _ exchange.Exchange = (*Client)(nil)
 
 // defaultSlippage is how far past the mid an IOC "market" leg is priced so it
 // crosses the book and fills immediately. 5% mirrors the reference SDK's
-// market-order default — generous enough to fill, the realized price is the book's.
+// market-order default — generous enough to fill on a liquid book, the realized
+// price is the book's. It is the fallback when Config.Slippage is unset; thin
+// books (e.g. testnet, where spreads run 20–50%) need a wider value (HL_SLIPPAGE)
+// or the IOC won't reach a resting order and Hyperliquid rejects it as no-match.
 const defaultSlippage = 0.05
 
 // wire* are the exact on-wire shape of an order action. Field order and msgpack
@@ -126,7 +129,7 @@ func (c *Client) PlaceOrder(ctx context.Context, req exchange.OrderRequest) (*ex
 	if err != nil {
 		return nil, err
 	}
-	limitPx := slippagePrice(mid, isBuy)
+	limitPx := slippagePrice(mid, c.slippage, isBuy)
 
 	action := orderAction{
 		Type: "order",
@@ -224,7 +227,12 @@ func (c *Client) Classify(err error) exchange.ErrorKind {
 	case strings.Contains(msg, "insufficient"),
 		strings.Contains(msg, "margin"),
 		strings.Contains(msg, "reduce only"),
-		strings.Contains(msg, "reduce-only"):
+		strings.Contains(msg, "reduce-only"),
+		// An IOC that crossed nothing ("could not immediately match against any
+		// resting orders") is terminal, not transient: retrying the same priced-off-mid
+		// IOC against the same book just fails again. Surface it as exec.failed (and a
+		// wider HL_SLIPPAGE / more liquidity is the real fix), don't burn maxDeliver.
+		strings.Contains(msg, "could not immediately match"):
 		return exchange.ErrTerminal
 	}
 	return exchange.ErrOther
@@ -253,13 +261,13 @@ func (c *Client) midPrice(ctx context.Context, ref assetRef, coin string) (float
 	return px, nil
 }
 
-// slippagePrice pushes the mid defaultSlippage in the aggressive direction so an
+// slippagePrice pushes the mid by slippage in the aggressive direction so an
 // IOC limit crosses: above the mid to buy, below to sell.
-func slippagePrice(mid float64, isBuy bool) float64 {
+func slippagePrice(mid, slippage float64, isBuy bool) float64 {
 	if isBuy {
-		return mid * (1 + defaultSlippage)
+		return mid * (1 + slippage)
 	}
-	return mid * (1 - defaultSlippage)
+	return mid * (1 - slippage)
 }
 
 // cloidFromLinkID derives a deterministic 128-bit client order id (0x + 32 hex)

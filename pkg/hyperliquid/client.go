@@ -36,22 +36,24 @@ const (
 // BaseURL — it selects the phantom-agent source, and a mismatch makes every
 // signature invalid.
 type Config struct {
-	BaseURL    string // REST host; "" → MainnetAPI/TestnetAPI per Mainnet
-	Mainnet    bool   // phantom-agent source: true = "a", false = "b"
-	PrivateKey string // agent-wallet signing key; empty = no signed actions
-	Vault      string // optional sub-account/vault address; "" = trade as self
-	Account    string // master account for user queries (funding/fills); "" → derived
+	BaseURL    string  // REST host; "" → MainnetAPI/TestnetAPI per Mainnet
+	Mainnet    bool    // phantom-agent source: true = "a", false = "b"
+	PrivateKey string  // agent-wallet signing key; empty = no signed actions
+	Vault      string  // optional sub-account/vault address; "" = trade as self
+	Account    string  // master account for user queries (funding/fills); "" → derived
+	Slippage   float64 // IOC "market" price offset past mid; 0 → defaultSlippage (5%)
 }
 
 type Client struct {
-	http    *http.Client
-	baseURL string
-	mainnet bool
-	key     *ecdsa.PrivateKey   // nil if no signing key was provided
-	vault   *common.Address     // nil = trade as self
-	account common.Address      // address user queries target (funding/fills)
-	mu      sync.RWMutex        // guards the asset maps, refreshable at runtime
-	assets  map[string]assetRef // key: "<category>:<symbol>", e.g. "linear:BTCUSDT"
+	http     *http.Client
+	baseURL  string
+	mainnet  bool
+	key      *ecdsa.PrivateKey   // nil if no signing key was provided
+	vault    *common.Address     // nil = trade as self
+	account  common.Address      // address user queries target (funding/fills)
+	slippage float64             // IOC "market" price offset past mid (see order.go)
+	mu       sync.RWMutex        // guards the asset maps, refreshable at runtime
+	assets   map[string]assetRef // key: "<category>:<symbol>", e.g. "linear:BTCUSDT"
 }
 
 // assetRef is what an order needs about an instrument: its numeric id and the
@@ -73,11 +75,17 @@ func New(cfg Config) (*Client, error) {
 		}
 	}
 
+	slippage := cfg.Slippage
+	if slippage <= 0 {
+		slippage = defaultSlippage
+	}
+
 	c := &Client{
-		http:    &http.Client{Timeout: 10 * time.Second},
-		baseURL: strings.TrimRight(base, "/"),
-		mainnet: cfg.Mainnet,
-		assets:  map[string]assetRef{},
+		http:     &http.Client{Timeout: 10 * time.Second},
+		baseURL:  strings.TrimRight(base, "/"),
+		mainnet:  cfg.Mainnet,
+		slippage: slippage,
+		assets:   map[string]assetRef{},
 	}
 
 	if cfg.PrivateKey != "" {
