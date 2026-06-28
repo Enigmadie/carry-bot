@@ -14,15 +14,21 @@ const sampleMetaJSON = `{
   ]
 }`
 
+// Real-shaped: live HL names spot pairs "@<index>" (only PURR/USDC has a human
+// name), keys the base off the first token (BTC is the Unit-bridged "UBTC"), and
+// can list a base against several quotes — only the USDC pair should map, so @9
+// (UBTC/USDH) must be skipped in favour of @3 (UBTC/USDC).
 const sampleSpotMetaJSON = `{
   "tokens": [
     {"index": 0, "name": "USDC", "szDecimals": 8},
     {"index": 1, "name": "PURR", "szDecimals": 0},
-    {"index": 2, "name": "BTC",  "szDecimals": 5}
+    {"index": 2, "name": "UBTC", "szDecimals": 5},
+    {"index": 5, "name": "USDH", "szDecimals": 8}
   ],
   "universe": [
     {"name": "PURR/USDC", "index": 0, "tokens": [1, 0]},
-    {"name": "BTC/USDC",  "index": 3, "tokens": [2, 0]}
+    {"name": "@3",        "index": 3, "tokens": [2, 0]},
+    {"name": "@9",        "index": 9, "tokens": [2, 5]}
   ]
 }`
 
@@ -53,8 +59,8 @@ func TestResolveAsset(t *testing.T) {
 	}{
 		{"linear", "BTCUSDT", 0, 5},    // perp index = position in universe
 		{"linear", "ETHUSDT", 1, 4},    // quote suffix stripped: ETHUSDT → ETH
-		{"spot", "BTCUSDC", 10003, 5},  // spot asset = 10000 + index (3), base BTC szDecimals
-		{"spot", "PURRUSDC", 10000, 0}, // spot index 0
+		{"spot", "BTCUSDC", 10003, 5},  // BTC→UBTC alias, USDC pair @3 (not @9), base szDecimals
+		{"spot", "PURRUSDC", 10000, 0}, // spot index 0, no alias
 	}
 	for _, tc := range cases {
 		ref, err := c.resolveAsset(tc.category, tc.symbol)
@@ -78,7 +84,8 @@ func TestResolveAssetUnknown(t *testing.T) {
 func TestMarketKeys(t *testing.T) {
 	c := loadSample(t)
 
-	// BTC has a spot pair (BTC/USDC, index 3) → allMids spot key "@3".
+	// BTC resolves to the UBTC/USDC spot pair (@3) → allMids spot key "@3"; the
+	// perp coin stays the bare "BTC" (no alias on the perp leg).
 	coin, spotKey, ok := c.MarketKeys("BTCUSDT")
 	if coin != "BTC" || spotKey != "@3" || !ok {
 		t.Errorf("MarketKeys(BTCUSDT) = (%q, %q, %v), want (BTC, @3, true)", coin, spotKey, ok)

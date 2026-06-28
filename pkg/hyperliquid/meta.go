@@ -69,36 +69,66 @@ func buildPerpAssets(m metaResp) map[string]assetRef {
 	return out
 }
 
-// buildSpotAssets keys each pair by "spot:<base>" (the part before the slash),
-// with asset id 10000+index and the base token's size precision. Keying by base
-// coin is best-effort: it assumes one listed pair per base on the quote we trade,
-// which holds for the delta-neutral legs we place.
+// buildSpotAssets keys each USDC-quoted pair by "spot:<baseToken>", with asset id
+// 10000+index and the base token's size precision. The base comes from the pair's
+// first token, not its name: on live Hyperliquid almost every spot pair is named
+// "@<index>" (only PURR/USDC carries a human name), so parsing the name would
+// yield "@107" instead of the coin. A base can list against several quotes
+// (USDC, USDH, …); we keep only the USDC pair, which is the one a delta-neutral
+// spot leg trades against the perp's USDC margin.
 func buildSpotAssets(m spotMetaResp) map[string]assetRef {
-	tokenSz := make(map[int]int, len(m.Tokens))
+	type token struct {
+		name string
+		sz   int
+	}
+	tokens := make(map[int]token, len(m.Tokens))
+	usdc := -1
 	for _, t := range m.Tokens {
-		tokenSz[t.Index] = t.SzDecimals
+		tokens[t.Index] = token{name: t.Name, sz: t.SzDecimals}
+		if t.Name == "USDC" {
+			usdc = t.Index
+		}
 	}
 
 	out := make(map[string]assetRef, len(m.Universe))
 	for _, u := range m.Universe {
-		base := u.Name
-		if i := strings.IndexByte(base, '/'); i >= 0 {
-			base = base[:i]
+		if len(u.Tokens) < 2 || u.Tokens[1] != usdc {
+			continue // skip non-USDC-quoted pairs (and malformed entries)
 		}
-		sz := 0
-		if len(u.Tokens) > 0 {
-			sz = tokenSz[u.Tokens[0]]
+		base, ok := tokens[u.Tokens[0]]
+		if !ok {
+			continue
 		}
-		out["spot:"+base] = assetRef{Asset: spotAssetOffset + u.Index, SzDecimals: sz}
+		out["spot:"+base.name] = assetRef{Asset: spotAssetOffset + u.Index, SzDecimals: base.sz}
 	}
 	return out
+}
+
+// spotBaseAliases maps a neutral base coin to Hyperliquid's spot base token where
+// they differ. HL lists spot BTC/ETH as the Unit-bridged "UBTC"/"UETH", while
+// perps and our neutral symbols use the bare coin. Only spot resolution needs the
+// alias — the perp leg keeps the plain coin.
+var spotBaseAliases = map[string]string{
+	"BTC": "UBTC",
+	"ETH": "UETH",
+}
+
+func spotBaseAlias(coin string) string {
+	if a, ok := spotBaseAliases[coin]; ok {
+		return a
+	}
+	return coin
 }
 
 // resolveAsset maps an exchange-neutral (category, symbol) onto Hyperliquid's
 // asset id and size precision. The neutral symbol carries a quote suffix
 // ("BTCUSDT"); Hyperliquid indexes by coin, so the quote is stripped first.
 func (c *Client) resolveAsset(category, symbol string) (assetRef, error) {
-	key := category + ":" + stripQuote(symbol)
+	base := stripQuote(symbol)
+	if category == "spot" {
+		base = spotBaseAlias(base) // HL spot wraps BTC/ETH as UBTC/UETH
+	}
+	key := category + ":" + base
 
 	c.mu.RLock()
 	ref, ok := c.assets[key]
@@ -120,7 +150,7 @@ func (c *Client) resolveAsset(category, symbol string) (assetRef, error) {
 func (c *Client) MarketKeys(symbol string) (coin, spotKey string, spotOK bool) {
 	coin = stripQuote(symbol)
 	c.mu.RLock()
-	ref, ok := c.assets["spot:"+coin]
+	ref, ok := c.assets["spot:"+spotBaseAlias(coin)] // HL spot wraps BTC/ETH as UBTC/UETH
 	c.mu.RUnlock()
 	if ok {
 		spotKey = fmt.Sprintf("@%d", ref.Asset-spotAssetOffset)

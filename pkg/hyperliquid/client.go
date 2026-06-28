@@ -36,7 +36,7 @@ const (
 // BaseURL — it selects the phantom-agent source, and a mismatch makes every
 // signature invalid.
 type Config struct {
-	BaseURL    string // REST host; "" → TestnetAPI
+	BaseURL    string // REST host; "" → MainnetAPI/TestnetAPI per Mainnet
 	Mainnet    bool   // phantom-agent source: true = "a", false = "b"
 	PrivateKey string // agent-wallet signing key; empty = no signed actions
 	Vault      string // optional sub-account/vault address; "" = trade as self
@@ -62,9 +62,15 @@ type assetRef struct {
 }
 
 func New(cfg Config) (*Client, error) {
+	// Default the REST host to match the network the signature targets: defaulting
+	// to testnet while Mainnet is set would silently point /info and /exchange at a
+	// different network than the one the phantom-agent source signs for.
 	base := cfg.BaseURL
 	if base == "" {
 		base = TestnetAPI
+		if cfg.Mainnet {
+			base = MainnetAPI
+		}
 	}
 
 	c := &Client{
