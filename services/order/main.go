@@ -106,6 +106,7 @@ type config struct {
 	HLVault      string  // hyperliquid: optional vault/sub-account address
 	HLAccount    string  // hyperliquid: master account for funding queries
 	HLSlippage   float64 // hyperliquid: IOC price offset past mid; 0 → client default (5%)
+	HLLeverage   int     // hyperliquid: perp leverage set (cross) at startup; 0 → skip
 
 	MetricsAddr string
 }
@@ -130,6 +131,7 @@ func loadConfig() config {
 		HLVault:      os.Getenv("HL_VAULT"),
 		HLAccount:    os.Getenv("HL_ACCOUNT"),
 		HLSlippage:   getfloat("HL_SLIPPAGE", 0),
+		HLLeverage:   getint("HL_LEVERAGE", 3),
 
 		MetricsAddr: getenv("METRICS_ADDR", ":2114"),
 	}
@@ -176,6 +178,15 @@ func buildExchange(ctx context.Context, cfg config) (exchange.Exchange, error) {
 		// switch, before handing the client back ready to trade.
 		if err := c.LoadMeta(ctx); err != nil {
 			return nil, fmt.Errorf("load hyperliquid meta: %w", err)
+		}
+		// Hyperliquid opens a perp in isolated 10x by default, which strands the spot
+		// USDC and can block the close (see leverage.go). Switch the perp to cross at a
+		// low leverage so the spot collateral backs the short. Persists on the account,
+		// so once at startup is enough; HL_LEVERAGE=0 opts out (leave the account as-is).
+		if cfg.HLLeverage > 0 {
+			if err := c.UpdateLeverage(ctx, cfg.Symbol, true, cfg.HLLeverage); err != nil {
+				return nil, fmt.Errorf("set hyperliquid leverage: %w", err)
+			}
 		}
 		return c, nil
 	default:
@@ -513,6 +524,7 @@ func (s *service) emitClosed(ctx context.Context, in events.Intent, spot, perp *
 }
 
 func (s *service) emitFailed(ctx context.Context, in events.Intent, reason string) {
+	s.log.Warn("terminal failure, emitting exec.failed", "id", in.ID, "side", in.Side, "reason", reason)
 	s.emit(ctx, events.SubjExecFailed, events.ExecReport{
 		IntentID: in.ID, Symbol: in.Symbol, Side: in.Side, Qty: s.qty(),
 		Error: reason, Time: time.Now().UTC(),
@@ -574,6 +586,15 @@ func getfloat(key string, def float64) float64 {
 	if v := os.Getenv(key); v != "" {
 		if f, err := strconv.ParseFloat(v, 64); err == nil {
 			return f
+		}
+	}
+	return def
+}
+
+func getint(key string, def int) int {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
 		}
 	}
 	return def
