@@ -106,7 +106,8 @@ type config struct {
 	HLVault      string  // hyperliquid: optional vault/sub-account address
 	HLAccount    string  // hyperliquid: master account for funding queries
 	HLSlippage   float64 // hyperliquid: IOC price offset past mid; 0 → client default (5%)
-	HLLeverage   int     // hyperliquid: perp leverage set (cross) at startup; 0 → skip
+	HLLeverage   int     // hyperliquid: perp leverage set at startup; 0 → skip
+	HLCross      bool    // hyperliquid: cross margin (true) vs isolated; some assets are isolated-only
 
 	MetricsAddr string
 }
@@ -132,6 +133,7 @@ func loadConfig() config {
 		HLAccount:    os.Getenv("HL_ACCOUNT"),
 		HLSlippage:   getfloat("HL_SLIPPAGE", 0),
 		HLLeverage:   getint("HL_LEVERAGE", 3),
+		HLCross:      getbool("HL_CROSS", true),
 
 		MetricsAddr: getenv("METRICS_ADDR", ":2114"),
 	}
@@ -179,12 +181,15 @@ func buildExchange(ctx context.Context, cfg config) (exchange.Exchange, error) {
 		if err := c.LoadMeta(ctx); err != nil {
 			return nil, fmt.Errorf("load hyperliquid meta: %w", err)
 		}
-		// Hyperliquid opens a perp in isolated 10x by default, which strands the spot
-		// USDC and can block the close (see leverage.go). Switch the perp to cross at a
-		// low leverage so the spot collateral backs the short. Persists on the account,
-		// so once at startup is enough; HL_LEVERAGE=0 opts out (leave the account as-is).
+		// Hyperliquid opens a perp in isolated 10x by default, whose thin posted margin
+		// can block the close (see leverage.go). Lowering the leverage posts more margin
+		// (and cross, where allowed, lets the spot USDC back the short too) so the close
+		// absorbs the slippage loss. Cross is preferred but some assets are isolated-only
+		// (HYPE testnet rejects cross) — HL_CROSS=false selects isolated low-leverage,
+		// which posts enough margin on its own. Persists on the account, so once at
+		// startup is enough; HL_LEVERAGE=0 opts out (leave the account as-is).
 		if cfg.HLLeverage > 0 {
-			if err := c.UpdateLeverage(ctx, cfg.Symbol, true, cfg.HLLeverage); err != nil {
+			if err := c.UpdateLeverage(ctx, cfg.Symbol, cfg.HLCross, cfg.HLLeverage); err != nil {
 				return nil, fmt.Errorf("set hyperliquid leverage: %w", err)
 			}
 		}
