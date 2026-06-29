@@ -1,6 +1,7 @@
 package hyperliquid
 
 import (
+	"encoding/json"
 	"errors"
 	"testing"
 
@@ -69,6 +70,34 @@ func TestSlippagePrice(t *testing.T) {
 	// A wider slippage pushes the IOC price further past the mid (thin-book case).
 	if wide, narrow := slippagePrice(mid, 0.5, true), slippagePrice(mid, 0.05, true); wide <= narrow {
 		t.Errorf("wider slippage buy %v should exceed narrower %v", wide, narrow)
+	}
+}
+
+func TestParseMarkPrice(t *testing.T) {
+	// The [meta, ctxs] pair: ctx index aligns with perp universe index (the asset id).
+	raw := []json.RawMessage{
+		json.RawMessage(`{"universe":[{"name":"BTC"},{"name":"ETH"}]}`),
+		json.RawMessage(`[{"markPx":"65000.0","oraclePx":"64950.0"},{"markPx":"3400.0","oraclePx":"3399.0"}]`),
+	}
+	// markPx wins for the asset at the requested index.
+	if px, err := parseMarkPrice(raw, 1); err != nil || px != 3400.0 {
+		t.Fatalf("parseMarkPrice(idx 1) = %v, %v; want 3400, nil", px, err)
+	}
+	// Empty markPx falls back to oraclePx.
+	fallback := []json.RawMessage{
+		raw[0],
+		json.RawMessage(`[{"markPx":"","oraclePx":"64950.0"}]`),
+	}
+	if px, err := parseMarkPrice(fallback, 0); err != nil || px != 64950.0 {
+		t.Fatalf("parseMarkPrice fallback = %v, %v; want 64950, nil", px, err)
+	}
+	// Out-of-range index is an error, not a panic.
+	if _, err := parseMarkPrice(raw, 5); err == nil {
+		t.Fatal("expected error for out-of-range index")
+	}
+	// A malformed top-level shape is an error.
+	if _, err := parseMarkPrice(raw[:1], 0); err == nil {
+		t.Fatal("expected error for missing ctxs element")
 	}
 }
 

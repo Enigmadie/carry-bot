@@ -4,9 +4,13 @@ package hyperliquid
 // parts that differ from a CEX:
 //
 //   - No market order. Hyperliquid only has limit orders, so a "market" buy/sell
-//     is an IOC (immediate-or-cancel) limit priced through the book — we fetch the
-//     mid price and shove the limit defaultSlippage past it so it crosses and fills
-//     now, cancelling any unfilled remainder instead of resting.
+//     is an IOC (immediate-or-cancel) limit priced through the book — we shove the
+//     limit defaultSlippage past a reference price so it crosses and fills now,
+//     cancelling any unfilled remainder instead of resting. Perps reference the
+//     oracle mark (fair value); spot references the book mid (no oracle, and spot is
+//     not the margin-sensitive leg). Pricing off the mark keeps the slippage a bound
+//     on adverse fill versus fair value: a book mid detached from the mark (testnet)
+//     would otherwise compound the skew when slippage is slapped on top of it.
 //   - Tick/lot rules. Size rounds to the instrument's szDecimals; price rounds to 5
 //     significant figures and at most (6 − szDecimals) decimals for perps, (8 −
 //     szDecimals) for spot. A price that breaks these is silently rejected.
@@ -124,12 +128,18 @@ func (c *Client) PlaceOrder(ctx context.Context, req exchange.OrderRequest) (*ex
 	isBuy := req.Side == exchange.SideBuy
 	isSpot := ref.Asset >= spotAssetOffset
 
-	// "Market" leg → IOC limit priced through the book off the current mid.
-	mid, err := c.midPrice(ctx, ref, stripQuote(req.Symbol))
+	// "Market" leg → IOC limit priced through the book. Perps reference the oracle
+	// mark (fair value); spot, which has no oracle ctx, references the book mid.
+	var refPx float64
+	if isSpot {
+		refPx, err = c.midPrice(ctx, ref, stripQuote(req.Symbol))
+	} else {
+		refPx, err = c.markPrice(ctx, ref)
+	}
 	if err != nil {
 		return nil, err
 	}
-	limitPx := slippagePrice(mid, c.slippage, isBuy)
+	limitPx := slippagePrice(refPx, c.slippage, isBuy)
 
 	action := orderAction{
 		Type: "order",
@@ -261,8 +271,50 @@ func (c *Client) midPrice(ctx context.Context, ref assetRef, coin string) (float
 	return px, nil
 }
 
-// slippagePrice pushes the mid by slippage in the aggressive direction so an
-// IOC limit crosses: above the mid to buy, below to sell.
+// markPrice fetches a perp's oracle mark from /info "metaAndAssetCtxs". The reply is
+// the heterogeneous pair [meta, [ctx, …]] where ctx[i] aligns with perp universe
+// index i — which is exactly the perp asset id. We reference the mark rather than the
+// book mid so the slippage bounds adverse fill versus fair value (see PlaceOrder's
+// header). markPx is what Hyperliquid evaluates margin and uPnL against; oraclePx is
+// the fallback when it is absent.
+func (c *Client) markPrice(ctx context.Context, ref assetRef) (float64, error) {
+	var raw []json.RawMessage
+	if err := c.info(ctx, map[string]string{"type": "metaAndAssetCtxs"}, &raw); err != nil {
+		return 0, fmt.Errorf("meta and asset ctxs: %w", err)
+	}
+	return parseMarkPrice(raw, ref.Asset)
+}
+
+// parseMarkPrice pulls the mark (or oracle, as fallback) price for perp index idx out
+// of a decoded metaAndAssetCtxs reply, split out from the network call so it is unit
+// testable on canonical JSON.
+func parseMarkPrice(raw []json.RawMessage, idx int) (float64, error) {
+	if len(raw) < 2 {
+		return 0, fmt.Errorf("metaAndAssetCtxs: expected [meta, ctxs], got %d elements", len(raw))
+	}
+	var ctxs []struct {
+		MarkPx   string `json:"markPx"`
+		OraclePx string `json:"oraclePx"`
+	}
+	if err := json.Unmarshal(raw[1], &ctxs); err != nil {
+		return 0, fmt.Errorf("decode asset ctxs: %w", err)
+	}
+	if idx < 0 || idx >= len(ctxs) {
+		return 0, fmt.Errorf("no asset ctx for perp index %d (have %d)", idx, len(ctxs))
+	}
+	px := ctxs[idx].MarkPx
+	if px == "" {
+		px = ctxs[idx].OraclePx
+	}
+	v, err := strconv.ParseFloat(px, 64)
+	if err != nil {
+		return 0, fmt.Errorf("parse mark %q: %w", px, err)
+	}
+	return v, nil
+}
+
+// slippagePrice pushes the reference price by slippage in the aggressive direction so
+// an IOC limit crosses: above it to buy, below it to sell.
 func slippagePrice(mid, slippage float64, isBuy bool) float64 {
 	if isBuy {
 		return mid * (1 + slippage)
