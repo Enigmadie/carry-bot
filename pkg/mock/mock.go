@@ -45,6 +45,12 @@ type Exchange struct {
 	mu       sync.Mutex
 	seen     map[string]string // orderLinkId -> orderId
 	fundingN int               // monotonic settlement counter, for deterministic ids
+
+	// Live position, mutated by fills, so State reflects what was traded — the
+	// same contract a real exchange gives reconciliation. In-memory like the
+	// rest of the mock: a restart forgets it and reconciles as flat.
+	perpSize float64 // signed; our short goes negative
+	spotSize float64
 }
 
 // New builds a mock. failCategory ("spot"/"linear"/"") forces that leg to fail
@@ -66,6 +72,17 @@ func (m *Exchange) PlaceOrder(_ context.Context, req exchange.OrderRequest) (*ex
 	orderID := "mock-" + req.OrderLinkID
 	m.seen[req.OrderLinkID] = orderID
 	qty, _ := strconv.ParseFloat(req.Qty, 64)
+
+	delta := qty
+	if req.Side == exchange.SideSell {
+		delta = -qty
+	}
+	if req.Category == exchange.CategoryLinear {
+		m.perpSize += delta
+	} else {
+		m.spotSize += delta
+	}
+
 	return &exchange.OrderResult{
 		OrderID:     orderID,
 		OrderLinkID: req.OrderLinkID,
@@ -89,6 +106,18 @@ func (m *Exchange) Funding(_ context.Context, symbol string, _ time.Time) ([]exc
 		Amount: mockFundingQty * mockPrice * mockFundingRate,
 		Time:   time.Now().UTC(),
 	}}, nil
+}
+
+// State reports the fill-tracked position, so order-service's startup
+// reconciliation sees the same shape of truth a real exchange would give it.
+func (m *Exchange) State(_ context.Context, _ string) (*exchange.PositionState, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return &exchange.PositionState{
+		PerpSize:   m.perpSize,
+		SpotSize:   m.spotSize,
+		Collateral: 1000,
+	}, nil
 }
 
 func (m *Exchange) Classify(err error) exchange.ErrorKind {

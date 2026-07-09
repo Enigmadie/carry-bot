@@ -21,6 +21,7 @@ const (
 	SubjPositionClosed  = "exec.position.closed"
 	SubjExecFailed      = "exec.failed"
 	SubjFundingReceived = "exec.funding.received"
+	SubjReconciled      = "exec.reconciled"
 
 	// Portfolio state — JetStream (last value retained).
 	SubjPositionState = "portfolio.position.state"
@@ -78,6 +79,28 @@ type ExecReport struct {
 	Fee         float64   `json:"fee,omitempty"`   // total fee across both legs, quote currency
 	Error       string    `json:"error,omitempty"` // set on SubjExecFailed
 	Time        time.Time `json:"time"`
+}
+
+// Reconciliation verdicts, carried in Reconciled.Verdict.
+const (
+	ReconcileFlat       = "flat"
+	ReconcileOpen       = "open"
+	ReconcileUnbalanced = "unbalanced"
+)
+
+// Reconciled is a snapshot of the exchange's live position, emitted by
+// order-service at startup after comparing it against the configured order
+// size. It is the single point where exchange truth enters the event flow:
+// strategy initialises its state machine from it and portfolio checks its
+// ledger against it. An unbalanced verdict means order-service is halted.
+type Reconciled struct {
+	Symbol     string    `json:"symbol"`
+	Verdict    string    `json:"verdict"`   // ReconcileFlat | ReconcileOpen | ReconcileUnbalanced
+	PerpSize   float64   `json:"perp_size"` // signed; short negative
+	SpotSize   float64   `json:"spot_size"`
+	Collateral float64   `json:"collateral"`
+	OpenOrders int       `json:"open_orders"`
+	Time       time.Time `json:"time"`
 }
 
 // FundingReceived is a fact emitted by order-service when the exchange credits a

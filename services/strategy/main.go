@@ -1,7 +1,16 @@
 // Command strategy listens to market-data ticks on core NATS and decides when
 // to open or close the delta-neutral position. Decisions ("intents") are
 // published to JetStream so they are durable: a lost "close" signal is real
-// money. This is the first service that uses JetStream rather than core NATS.
+// money.
+//
+// The position state machine is driven by execution facts, not by our own
+// intents: publishing an intent moves the state to pending, and only the
+// exec.position.opened/closed fact from order-service confirms the flip (an
+// exec.failed reverts it). A durable consumer on the EXEC stream replays those
+// facts across restarts, and order-service's startup exec.reconciled snapshot
+// anchors them to the exchange's live position — so strategy never believes in
+// a position the exchange doesn't hold, which is exactly how the first live
+// run desynced (intent acked, legs failed, state said open).
 package main
 
 import (
@@ -27,6 +36,7 @@ import (
 
 const (
 	streamName   = "STRATEGY"
+	execStream   = "EXEC" // produced by order-service; we consume the facts
 	streamMaxAge = 72 * time.Hour
 )
 
@@ -37,7 +47,7 @@ var (
 	}, []string{"side"})
 	stateGauge = promauto.NewGauge(prometheus.GaugeOpts{
 		Namespace: metrics.Namespace, Subsystem: "strategy",
-		Name: "state", Help: "Position state machine: 0 flat, 1 open.",
+		Name: "state", Help: "Position state machine: 0 flat, 1 open, 2 pending open, 3 pending close, -1 halted.",
 	})
 	publishErrors = promauto.NewCounter(prometheus.CounterOpts{
 		Namespace: metrics.Namespace, Subsystem: "strategy",
@@ -63,16 +73,51 @@ func loadConfig() config {
 	}
 }
 
-// position is the in-memory state machine. v1 keeps it in memory only: a
-// restart forgets whether we hold a position. That is acceptable here because
-// reconciliation against the exchange at startup is a separate, later step —
-// the exchange is the source of truth, not this process.
+// position is the in-memory state machine, rebuilt on every start by replaying
+// the durable EXEC stream (facts + order-service's reconcile snapshot). The
+// pending states cover the window between publishing an intent and hearing the
+// execution fact back: while pending, evaluate() stays quiet, so a funding tick
+// can't fire a second intent at an in-flight one. halted mirrors an unbalanced
+// reconcile — the exchange position needs a human, so no intents at all.
 type position int
 
 const (
 	flat position = iota
 	open
+	pendingOpen
+	pendingClose
+	halted
 )
+
+func (p position) String() string {
+	switch p {
+	case flat:
+		return "flat"
+	case open:
+		return "open"
+	case pendingOpen:
+		return "pending-open"
+	case pendingClose:
+		return "pending-close"
+	case halted:
+		return "halted"
+	}
+	return "unknown"
+}
+
+// gauge values match the stateGauge help text.
+var stateGaugeValue = map[position]float64{
+	flat: 0, open: 1, pendingOpen: 2, pendingClose: 3, halted: -1,
+}
+
+func (s *service) setState(p position, why string) {
+	if s.state == p {
+		return
+	}
+	s.log.Info("state", "from", s.state, "to", p, "why", why)
+	s.state = p
+	stateGauge.Set(stateGaugeValue[p])
+}
 
 // tick is one normalised market update fanned in from the three subscriptions.
 // Funneling every event through a single channel lets one goroutine own all
@@ -93,6 +138,13 @@ type service struct {
 	state     position
 	spotPrice float64
 	perpPrice float64
+
+	// Seeding: on startup the EXEC replay walks the state machine to the current
+	// truth; until it has caught up, evaluate() must not emit — a funding tick
+	// racing the replay would fire an intent from a stale (default flat) state.
+	seeded      bool
+	seedPending uint64 // facts the replay still owes us at startup
+	seedSeen    uint64
 }
 
 func main() {
@@ -144,10 +196,64 @@ func main() {
 	log.Info("shutdown complete")
 }
 
-// run wires up the three subscriptions and owns all mutable state in its select
-// loop. Subscription callbacks run on their own goroutines, so they only parse
-// and forward onto ticks; nothing outside this goroutine mutates state.
+// run wires up the three market-data subscriptions plus the EXEC fact consumer
+// and owns all mutable state in its select loop. Subscription and consumer
+// callbacks run on their own goroutines, so they only parse and forward onto
+// channels; nothing outside this goroutine mutates state.
 func (s *service) run(ctx context.Context, nc *nats.Conn) error {
+	// EXEC is owned by order-service; ensure it here too (same config) so
+	// strategy can start independently of start order, like portfolio does.
+	if _, err := s.js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
+		Name:      execStream,
+		Subjects:  []string{"exec.>"},
+		Storage:   jetstream.FileStorage,
+		Retention: jetstream.LimitsPolicy,
+		MaxAge:    streamMaxAge,
+	}); err != nil {
+		return fmt.Errorf("ensure exec stream: %w", err)
+	}
+
+	// Ephemeral, deliver-all: every start replays the stream's retained facts
+	// from the beginning, walking the state machine to the current truth. A
+	// durable would be wrong here — its cursor sits past the already-consumed
+	// history, so a restart would learn nothing and boot as flat. Transitions
+	// are idempotent, so re-applying old facts is free; AckNone because we keep
+	// no cursor to advance. If the whole window aged out (MaxAge) while a
+	// position is held, we still boot flat — order-service's stale-intent guard
+	// answers the resulting intent with a fresh reconcile snapshot (see its
+	// open/closePosition), so the machine self-corrects before any trade.
+	cons, err := s.js.CreateOrUpdateConsumer(ctx, execStream, jetstream.ConsumerConfig{
+		AckPolicy:     jetstream.AckNonePolicy,
+		DeliverPolicy: jetstream.DeliverAllPolicy,
+		FilterSubjects: []string{
+			events.SubjPositionOpened, events.SubjPositionClosed,
+			events.SubjExecFailed, events.SubjReconciled,
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("ensure exec consumer: %w", err)
+	}
+
+	// How much history the replay owes us; evaluate() stays quiet until the
+	// backlog has been applied (see onExec), so a live funding tick can't race
+	// the replay and fire an intent off a stale state.
+	info, err := cons.Info(ctx)
+	if err != nil {
+		return fmt.Errorf("exec consumer info: %w", err)
+	}
+	s.seedPending = info.NumPending
+	if s.seedPending == 0 {
+		s.seeded = true
+	}
+	s.log.Info("seeding state from exec history", "facts", s.seedPending)
+
+	execs := make(chan jetstream.Msg, 16)
+	cc, err := cons.Consume(func(m jetstream.Msg) { execs <- m })
+	if err != nil {
+		return fmt.Errorf("start exec consume: %w", err)
+	}
+	defer cc.Stop()
+
 	ticks := make(chan tick, 64)
 
 	subs := []struct {
@@ -187,7 +293,67 @@ func (s *service) run(ctx context.Context, nc *nats.Conn) error {
 			return ctx.Err()
 		case t := <-ticks:
 			s.onTick(ctx, t)
+		case m := <-execs:
+			s.onExec(m)
 		}
+	}
+}
+
+// onExec applies one execution fact to the state machine. Facts are truth, so
+// opened/closed apply from any state (a replayed history walks the machine
+// forward); a failure only reverts the pending state it belongs to; a reconcile
+// snapshot overrides everything — it is the exchange's own word. No ack
+// bookkeeping: the consumer is AckNone, a decode error just skips the fact.
+func (s *service) onExec(m jetstream.Msg) {
+	defer s.countSeed()
+	switch m.Subject() {
+	case events.SubjReconciled:
+		var r events.Reconciled
+		if err := json.Unmarshal(m.Data(), &r); err != nil {
+			s.log.Error("unmarshal reconciled", "err", err)
+			return
+		}
+		switch r.Verdict {
+		case events.ReconcileOpen:
+			s.setState(open, "reconciled")
+		case events.ReconcileFlat:
+			s.setState(flat, "reconciled")
+		default:
+			s.log.Error("exchange unbalanced at reconcile — halting strategy",
+				"perp", r.PerpSize, "spot", r.SpotSize)
+			s.setState(halted, "reconciled unbalanced")
+		}
+	case events.SubjPositionOpened, events.SubjPositionClosed, events.SubjExecFailed:
+		var r events.ExecReport
+		if err := json.Unmarshal(m.Data(), &r); err != nil {
+			s.log.Error("unmarshal exec report", "err", err)
+			return
+		}
+		switch m.Subject() {
+		case events.SubjPositionOpened:
+			s.setState(open, "exec opened "+r.IntentID)
+		case events.SubjPositionClosed:
+			s.setState(flat, "exec closed "+r.IntentID)
+		case events.SubjExecFailed:
+			if s.state == pendingOpen && r.Side == events.IntentOpen {
+				s.setState(flat, "open failed "+r.IntentID)
+			} else if s.state == pendingClose && r.Side == events.IntentClose {
+				s.setState(open, "close failed "+r.IntentID)
+			}
+		}
+	}
+}
+
+// countSeed marks the startup backlog as applied fact by fact; once the replay
+// has caught up, evaluate() is unmuted.
+func (s *service) countSeed() {
+	if s.seeded {
+		return
+	}
+	s.seedSeen++
+	if s.seedSeen >= s.seedPending {
+		s.seeded = true
+		s.log.Info("state seeded from exec history", "facts", s.seedSeen, "state", s.state)
 	}
 }
 
@@ -202,9 +368,14 @@ func (s *service) onTick(ctx context.Context, t tick) {
 	}
 }
 
-// evaluate is the entry/exit state machine. Hysteresis (Exit < Entry) stops the
-// position from flapping when funding wobbles around a single threshold.
+// evaluate is the entry/exit trigger. Hysteresis (Exit < Entry) stops the
+// position from flapping when funding wobbles around a single threshold. Only
+// the two confirmed states act; pending waits for the execution fact and
+// halted waits for a human.
 func (s *service) evaluate(ctx context.Context, fr events.FundingRate) {
+	if !s.seeded {
+		return // replay still walking the state machine to the current truth
+	}
 	switch s.state {
 	case flat:
 		if fr.Rate >= s.cfg.EntryThreshold {
@@ -221,13 +392,15 @@ func (s *service) evaluate(ctx context.Context, fr events.FundingRate) {
 	}
 }
 
-// emit publishes an intent to JetStream and only flips the state machine once
-// the server acks the write. js.Publish is synchronous: unlike core NATS'
-// fire-and-forget Publish (used in market-data), it waits for the server to
-// persist the message. If the ack fails we keep the old state and retry on the
-// next funding tick — better to re-emit than to silently lose a close signal.
-// WithMsgID sets the JetStream dedup key, so a retried publish of the same
-// intent ID is collapsed server-side within the dedup window.
+// emit publishes an intent to JetStream and moves the state machine to the
+// matching pending state once the server acks the write — the confirmed flip
+// only happens when the execution fact comes back (see onExec). js.Publish is
+// synchronous: unlike core NATS' fire-and-forget Publish (used in market-data),
+// it waits for the server to persist the message. If the ack fails we keep the
+// old state and retry on the next funding tick — better to re-emit than to
+// silently lose a close signal. WithMsgID sets the JetStream dedup key, so a
+// retried publish of the same intent ID is collapsed server-side within the
+// dedup window.
 func (s *service) emit(ctx context.Context, subj, side, reason string, fr events.FundingRate) {
 	intent := events.Intent{
 		ID:        nuid.Next(),
@@ -253,11 +426,9 @@ func (s *service) emit(ctx context.Context, subj, side, reason string, fr events
 	}
 
 	if side == events.IntentOpen {
-		s.state = open
-		stateGauge.Set(1)
+		s.setState(pendingOpen, "intent published "+intent.ID)
 	} else {
-		s.state = flat
-		stateGauge.Set(0)
+		s.setState(pendingClose, "intent published "+intent.ID)
 	}
 	intentsTotal.WithLabelValues(side).Inc()
 	s.log.Info("intent published",

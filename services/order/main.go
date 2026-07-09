@@ -28,6 +28,7 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -84,6 +85,10 @@ var (
 	fundingReceivedTotal = promauto.NewCounter(prometheus.CounterOpts{
 		Namespace: metrics.Namespace, Subsystem: "order",
 		Name: "funding_received_total", Help: "Funding settlements emitted to the EXEC stream.",
+	})
+	haltedGauge = promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: metrics.Namespace, Subsystem: "order",
+		Name: "halted", Help: "1 when trading is halted (unbalanced position at reconcile); manual intervention required.",
 	})
 )
 
@@ -144,6 +149,17 @@ type service struct {
 	js  jetstream.JetStream
 	ex  exchange.Exchange
 	cfg config
+
+	// halted is set once, during startup reconciliation, before the consumer
+	// starts — an unbalanced exchange position must be fixed by a human, and
+	// until then every intent is dropped instead of trading on top of it.
+	halted bool
+
+	// positionOpen mirrors whether the pair is currently held. Written by the
+	// intent worker (reconcile/opened/closed), read by the funding poller on its
+	// own goroutine — hence atomic. It gates funding emission so the ledger
+	// doesn't accumulate unattached payments while flat.
+	positionOpen atomic.Bool
 }
 
 // buildExchange selects the provider from config. mock-first: the default needs no
@@ -258,6 +274,14 @@ func (s *service) run(ctx context.Context) error {
 		return fmt.Errorf("ensure exec stream: %w", err)
 	}
 
+	// Reconcile against the exchange before consuming a single intent: local
+	// state is in-memory and a restart forgot it, so the exchange is the only
+	// source of truth about what we hold. Failing here exits the service — the
+	// restart policy retries, and trading blind is worse than not starting.
+	if err := s.reconcile(ctx); err != nil {
+		return fmt.Errorf("reconcile: %w", err)
+	}
+
 	// A durable, explicit-ack consumer. Durable means our read position survives
 	// a restart, so we resume where we left off instead of replaying history.
 	// Explicit ack means a message is redelivered until we ack it; MaxDeliver
@@ -300,6 +324,82 @@ func (s *service) run(ctx context.Context) error {
 	}
 }
 
+// Leg-size tolerances for reconciliation, as fractions of ORDER_QTY. A leg
+// counts as held from 90% — the spot balance runs slightly under the ordered
+// qty because Hyperliquid takes the spot fee in the received token — and as
+// absent up to 10% (dust). Anything in between matches neither picture.
+const (
+	legFullFraction = 0.9
+	legDustFraction = 0.1
+)
+
+// classifyState maps the exchange's live position onto a reconcile verdict.
+// Anything that is neither cleanly flat nor cleanly both-legs-open — including
+// a perp long (we only ever short) and resting orders (we trade IOC only) —
+// is unbalanced and must halt trading for a human.
+func classifyState(st *exchange.PositionState, qty float64) string {
+	short := -st.PerpSize // held short comes back positive
+	perpOpen := short >= qty*legFullFraction
+	perpFlat := short <= qty*legDustFraction && st.PerpSize <= qty*legDustFraction
+	spotOpen := st.SpotSize >= qty*legFullFraction
+	spotFlat := st.SpotSize <= qty*legDustFraction
+
+	switch {
+	case st.OpenOrders > 0:
+		return events.ReconcileUnbalanced
+	case perpFlat && spotFlat:
+		return events.ReconcileFlat
+	case perpOpen && spotOpen:
+		return events.ReconcileOpen
+	default:
+		return events.ReconcileUnbalanced
+	}
+}
+
+// reconcile reads the live position from the exchange, publishes the snapshot
+// as a durable exec.reconciled fact (strategy seeds its state machine from it,
+// portfolio checks its ledger against it), and arms the local flags: the
+// funding gate on an open position, the halt on an unbalanced one.
+func (s *service) reconcile(ctx context.Context) error {
+	st, err := s.ex.State(ctx, s.cfg.Symbol)
+	if err != nil {
+		return err
+	}
+	verdict := classifyState(st, s.qty())
+
+	rep := events.Reconciled{
+		Symbol: s.cfg.Symbol, Verdict: verdict,
+		PerpSize: st.PerpSize, SpotSize: st.SpotSize,
+		Collateral: st.Collateral, OpenOrders: st.OpenOrders,
+		Time: time.Now().UTC(),
+	}
+	data, err := json.Marshal(rep)
+	if err != nil {
+		return fmt.Errorf("marshal reconciled: %w", err)
+	}
+	// Every startup is a distinct snapshot, so the dedup id carries the
+	// timestamp — two restarts inside the dedup window must both be seen.
+	msgID := fmt.Sprintf("reconciled:%d", rep.Time.UnixNano())
+	if _, err := s.js.Publish(ctx, events.SubjReconciled, data, jetstream.WithMsgID(msgID)); err != nil {
+		return fmt.Errorf("publish reconciled: %w", err)
+	}
+
+	switch verdict {
+	case events.ReconcileOpen:
+		s.positionOpen.Store(true)
+	case events.ReconcileUnbalanced:
+		s.halted = true
+		haltedGauge.Set(1)
+		alertsTotal.Inc()
+		s.log.Error("ALERT: exchange position unbalanced at reconcile — halting, manual intervention required",
+			"perp", st.PerpSize, "spot", st.SpotSize, "open_orders", st.OpenOrders)
+	}
+	s.log.Info("reconciled against exchange", "verdict", verdict,
+		"perp", st.PerpSize, "spot", st.SpotSize,
+		"collateral", st.Collateral, "open_orders", st.OpenOrders)
+	return nil
+}
+
 // handle processes one intent and settles its JetStream delivery: ack on a
 // terminal outcome (done, or recorded as failed), nak to retry a transient
 // problem. Bybit's orderLinkId dedup makes a retry safe.
@@ -308,6 +408,14 @@ func (s *service) handle(ctx context.Context, m jetstream.Msg) {
 	if err := json.Unmarshal(m.Data(), &intent); err != nil {
 		// Unparseable message: it will never succeed, so don't redeliver it.
 		s.log.Error("unmarshal intent", "err", err)
+		m.Term()
+		return
+	}
+
+	// Halted: the exchange position needs a human. Term, not nak — an intent
+	// decided before the halt must not fire after the position is fixed.
+	if s.halted {
+		s.log.Error("halted, dropping intent", "id", intent.ID, "side", intent.Side)
 		m.Term()
 		return
 	}
@@ -337,6 +445,19 @@ func (s *service) handle(ctx context.Context, m jetstream.Msg) {
 // leaves us flat rather than long. The spot leg is placed first because it is
 // the cheaper, more liquid one to unwind if we have to back out.
 func (s *service) openPosition(ctx context.Context, in events.Intent) error {
+	// Position-level idempotency, on top of the per-leg cloid dedup: an open on
+	// top of a held position would double it. Reaches here only through a state
+	// desync (e.g. strategy lost its exec history and re-decided from flat), so
+	// drop rather than trade — positionOpen is reconcile-seeded, so it is
+	// trusted — and answer with a fresh reconcile snapshot, which is what walks
+	// the desynced strategy back to the exchange's truth.
+	if s.positionOpen.Load() {
+		s.log.Warn("open intent while position already open, dropping and re-reconciling", "id", in.ID)
+		if err := s.reconcile(ctx); err != nil {
+			s.log.Warn("re-reconcile after stale intent", "err", err)
+		}
+		return nil
+	}
 	spot, err := s.placeLeg(ctx, in, exchange.OrderRequest{
 		Category:    exchange.CategorySpot,
 		Symbol:      in.Symbol,
@@ -390,6 +511,16 @@ func (s *service) openPosition(ctx context.Context, in events.Intent) error {
 // clean rollback — re-opening to rebalance is its own risk — so if the second
 // leg fails we are left unbalanced and halt the intent for a human.
 func (s *service) closePosition(ctx context.Context, in events.Intent) error {
+	// Mirror of openPosition's guard: closing nothing would place a naked spot
+	// sell (the reduce-only perp leg protects itself, the spot leg doesn't).
+	// The fresh snapshot walks a desynced strategy back to flat.
+	if !s.positionOpen.Load() {
+		s.log.Warn("close intent with no open position, dropping and re-reconciling", "id", in.ID)
+		if err := s.reconcile(ctx); err != nil {
+			s.log.Warn("re-reconcile after stale intent", "err", err)
+		}
+		return nil
+	}
 	perp, err := s.placeLeg(ctx, in, exchange.OrderRequest{
 		Category:    exchange.CategoryLinear,
 		Symbol:      in.Symbol,
@@ -454,10 +585,12 @@ func legID(intentID, leg string) string {
 
 // pollFunding periodically asks the exchange for funding credited since the last
 // poll and emits each settlement as a durable exec.funding.received fact. It is
-// stateless about positions — like the rest of order-service, which forgets
-// state across restarts — so it emits whenever the exchange reports funding;
-// portfolio attaches it to the open position and drops it when flat. `since`
-// advances past the newest settlement seen so a payment is emitted once.
+// gated on positionOpen (seeded by reconcile, flipped by opened/closed): funding
+// only accrues on a held position, and polling while flat would fill the ledger
+// with unattached payments (the mock emits one per poll unconditionally). One
+// trailing poll runs after a close to catch a settlement that landed between the
+// last open-poll and the close itself. `since` advances past the newest
+// settlement seen so a payment is emitted once.
 func (s *service) pollFunding(ctx context.Context) {
 	if s.cfg.FundingPoll <= 0 {
 		s.log.Info("funding polling disabled")
@@ -468,11 +601,17 @@ func (s *service) pollFunding(ctx context.Context) {
 	since := time.Now().UTC()
 	s.log.Info("polling funding", "every", s.cfg.FundingPoll, "symbol", s.cfg.Symbol)
 
+	wasOpen := false
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-t.C:
+			open := s.positionOpen.Load()
+			if !open && !wasOpen {
+				continue
+			}
+			wasOpen = open
 			payments, err := s.ex.Funding(ctx, s.cfg.Symbol, since)
 			if err != nil {
 				s.log.Warn("poll funding", "err", err)
@@ -513,6 +652,7 @@ func (s *service) emitOpened(ctx context.Context, in events.Intent, spot, perp *
 		SpotPrice: spot.Price, PerpPrice: perp.Price, Fee: spot.Fee + perp.Fee,
 		Time: time.Now().UTC(),
 	})
+	s.positionOpen.Store(true)
 	intentsTotal.WithLabelValues(in.Side, "opened").Inc()
 	s.log.Info("position opened", "id", in.ID, "reason", in.Reason)
 }
@@ -524,6 +664,7 @@ func (s *service) emitClosed(ctx context.Context, in events.Intent, spot, perp *
 		SpotPrice: spot.Price, PerpPrice: perp.Price, Fee: spot.Fee + perp.Fee,
 		Time: time.Now().UTC(),
 	})
+	s.positionOpen.Store(false)
 	intentsTotal.WithLabelValues(in.Side, "closed").Inc()
 	s.log.Info("position closed", "id", in.ID, "reason", in.Reason)
 }

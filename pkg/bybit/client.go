@@ -96,6 +96,13 @@ func (c *Client) Funding(_ context.Context, _ string, _ time.Time) ([]exchange.F
 	return nil, nil
 }
 
+// State errors rather than stubbing empty: reconciliation treats the reply as
+// the source of truth, and a fabricated "flat" could green-light trading on top
+// of a real position. The rudiment bybit lane fails loudly instead.
+func (c *Client) State(_ context.Context, _ string) (*exchange.PositionState, error) {
+	return nil, errors.New("bybit: State not implemented (rudiment provider)")
+}
+
 // Classify maps a PlaceOrder error onto an exchange.ErrorKind. A non-APIError is a
 // transport blip (transient); duplicate orderLinkId, regulatory bans, and
 // insufficient balance are pinned by code with a message fallback, since Bybit's

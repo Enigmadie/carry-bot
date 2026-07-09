@@ -55,6 +55,10 @@ var (
 		Namespace: metrics.Namespace, Subsystem: "portfolio",
 		Name: "funding_total", Help: "Sum of all booked funding settlements, quote currency.",
 	})
+	reconcileMismatch = promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: metrics.Namespace, Subsystem: "portfolio",
+		Name: "reconcile_mismatch", Help: "1 when the latest exchange reconcile snapshot disagrees with the ledger.",
+	})
 )
 
 const schema = `
@@ -165,7 +169,7 @@ func (s *service) run(ctx context.Context) error {
 	cons, err := s.js.CreateOrUpdateConsumer(ctx, execStream, jetstream.ConsumerConfig{
 		Durable:        durableName,
 		AckPolicy:      jetstream.AckExplicitPolicy,
-		FilterSubjects: []string{events.SubjPositionOpened, events.SubjPositionClosed, events.SubjExecFailed, events.SubjFundingReceived},
+		FilterSubjects: []string{events.SubjPositionOpened, events.SubjPositionClosed, events.SubjExecFailed, events.SubjFundingReceived, events.SubjReconciled},
 		AckWait:        ackWait,
 		MaxDeliver:     maxDeliver,
 	})
@@ -239,10 +243,14 @@ func (s *service) scrapeMetrics(ctx context.Context) {
 }
 
 func (s *service) handle(ctx context.Context, m jetstream.Msg) {
-	// Funding rides the same EXEC stream but carries a different payload, so it
-	// branches off before the ExecReport decode.
+	// Funding and reconcile snapshots ride the same EXEC stream but carry
+	// different payloads, so they branch off before the ExecReport decode.
 	if m.Subject() == events.SubjFundingReceived {
 		s.handleFunding(ctx, m)
+		return
+	}
+	if m.Subject() == events.SubjReconciled {
+		s.handleReconciled(ctx, m)
 		return
 	}
 
@@ -344,6 +352,47 @@ func (s *service) handleFunding(ctx context.Context, m jetstream.Msg) {
 		s.log.Warn("db write failed, will retry", "payment", f.PaymentID, "err", err)
 		m.Nak()
 		return
+	}
+	m.Ack()
+}
+
+// handleReconciled checks order-service's exchange snapshot against the ledger:
+// both should agree on whether a position is held. A mismatch is only reported
+// (warn log + gauge for alerting) — the ledger is history, not live state, and
+// deciding what to do about a divergence is the human's call. The gauge also
+// resets on agreement, so it tracks the *latest* snapshot.
+func (s *service) handleReconciled(ctx context.Context, m jetstream.Msg) {
+	var r events.Reconciled
+	if err := json.Unmarshal(m.Data(), &r); err != nil {
+		s.log.Error("unmarshal reconciled", "err", err)
+		m.Term()
+		return
+	}
+
+	var openCount int
+	if err := s.pool.QueryRow(ctx,
+		`SELECT count(*) FROM positions WHERE status = 'open'`).Scan(&openCount); err != nil {
+		s.log.Warn("reconcile check: query ledger failed, will retry", "err", err)
+		m.Nak()
+		return
+	}
+
+	ledgerOpen := openCount > 0
+	exchangeOpen := r.Verdict == events.ReconcileOpen
+	switch {
+	case r.Verdict == events.ReconcileUnbalanced:
+		reconcileMismatch.Set(1)
+		s.log.Error("reconcile: exchange position UNBALANCED, order-service halted",
+			"perp", r.PerpSize, "spot", r.SpotSize, "open_orders", r.OpenOrders)
+	case ledgerOpen != exchangeOpen:
+		reconcileMismatch.Set(1)
+		s.log.Error("reconcile: ledger disagrees with exchange",
+			"ledger_open_positions", openCount, "exchange_verdict", r.Verdict,
+			"perp", r.PerpSize, "spot", r.SpotSize)
+	default:
+		reconcileMismatch.Set(0)
+		s.log.Info("reconcile: ledger agrees with exchange",
+			"verdict", r.Verdict, "open_positions", openCount)
 	}
 	m.Ack()
 }

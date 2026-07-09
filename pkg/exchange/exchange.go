@@ -61,6 +61,16 @@ type FundingPayment struct {
 	Time   time.Time // settlement time
 }
 
+// PositionState is the exchange's live view of the delta-neutral pair for one
+// symbol, read at reconciliation. Sizes are in base coin; the exchange is the
+// source of truth, so these are what the local state machines must agree with.
+type PositionState struct {
+	PerpSize   float64 // signed perp position; our short is negative
+	SpotSize   float64 // spot base-token balance backing the long leg
+	Collateral float64 // quote-currency balance margining the perp, informational
+	OpenOrders int     // resting orders; the bot trades IOC only, so nonzero is an anomaly
+}
+
 type Exchange interface {
 	PlaceOrder(ctx context.Context, req OrderRequest) (*OrderResult, error)
 	Classify(err error) ErrorKind
@@ -68,4 +78,7 @@ type Exchange interface {
 	// first. An empty slice means nothing new — the common case between the
 	// exchange's funding intervals.
 	Funding(ctx context.Context, symbol string, since time.Time) ([]FundingPayment, error)
+	// State reads the account's live position for symbol, used to reconcile
+	// local state against the exchange at startup.
+	State(ctx context.Context, symbol string) (*PositionState, error)
 }
