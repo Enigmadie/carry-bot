@@ -1,0 +1,66 @@
+name: CI/CD carry-bot
+
+on:
+  push:
+    branches:
+      - main
+
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-carry-bot
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/enigmadie/carry-bot
+
+jobs:
+  build-push-deploy:
+    runs-on: self-hosted
+
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set image tag
+        run: echo "TAG=$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
+
+      - name: Test
+        run: docker build --target test .
+
+      - name: Build
+        run: docker build -t "$IMAGE:$TAG" .
+
+      - name: Log in to ghcr.io
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Push image
+        run: docker push "$IMAGE:$TAG"
+
+      - name: Checkout homelab-gitops
+        uses: actions/checkout@v4
+        with:
+          repository: Enigmadie/homelab-gitops
+          ssh-key: ${{ secrets.GITOPS_DEPLOY_KEY }}
+          path: gitops
+
+      - name: Bump image tag in gitops
+        working-directory: gitops
+        run: |
+          # One image ships all five binaries; bump every service manifest.
+          for f in workloads/carry-bot/{market-data,strategy,order,portfolio,notification}.yaml; do
+            sed -i -E "s|^([[:space:]]*image: ).*|\1${IMAGE}:${TAG}|" "$f"
+          done
+          if git diff --quiet; then
+            echo "image tag unchanged, nothing to push"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git commit -am "carry-bot: deploy ${TAG}"
+          git pull --rebase origin main
+          git push origin main

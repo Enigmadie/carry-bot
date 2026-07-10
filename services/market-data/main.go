@@ -19,6 +19,7 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -41,6 +42,12 @@ const (
 	mainnetWS = "wss://api.hyperliquid.xyz/ws"
 	testnetWS = "wss://api.hyperliquid-testnet.xyz/ws"
 )
+
+// staleTimeout is the gap-detection window: allMids ticks continuously and every
+// ping draws a pong, so a healthy socket is never silent for long. A connection
+// with no frame for this long is dead (half-open TCP won't error the read) and
+// gets torn down for a reconnect. A var so tests can shrink it.
+var staleTimeout = 45 * time.Second
 
 var (
 	ticksTotal = promauto.NewCounterVec(prometheus.CounterOpts{
@@ -189,19 +196,49 @@ func (s *service) streamOnce(ctx context.Context) error {
 	}
 	s.log.Info("subscribed", "url", s.cfg.WSURL, "coin", s.coin, "spot", s.spotKey)
 
-	// Ping on a child context so the ping goroutine stops as soon as this
-	// connection does.
+	// Ping and the staleness watchdog run on a child context so both stop as
+	// soon as this connection does. The read loop also uses connCtx: when the
+	// watchdog cancels it, the blocked Read unwinds — that is the only way out
+	// of a half-open socket that will never error on its own.
 	connCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	var lastFrame atomic.Int64
+	lastFrame.Store(time.Now().UnixNano())
 	go s.pingLoop(connCtx, c)
+	go watchdog(connCtx, cancel, &lastFrame)
 
 	for {
-		_, data, err := c.Read(ctx)
+		_, data, err := c.Read(connCtx)
 		if err != nil {
+			// Distinguish the watchdog firing from a plain read error: connCtx
+			// is cancelled but the root ctx (shutdown) is not.
+			if ctx.Err() == nil && connCtx.Err() != nil {
+				return fmt.Errorf("no frame for %v, connection presumed dead", staleTimeout)
+			}
 			return fmt.Errorf("read: %w", err)
 		}
+		lastFrame.Store(time.Now().UnixNano())
 		if err := s.dispatch(data); err != nil {
 			s.log.Warn("handle message", "err", err)
+		}
+	}
+}
+
+// watchdog cancels the connection when no frame has arrived within staleTimeout.
+// Any frame counts — price ticks or the pong our ping draws every pingInterval —
+// so a healthy connection can't trip it even in a quiet market.
+func watchdog(ctx context.Context, cancel context.CancelFunc, lastFrame *atomic.Int64) {
+	t := time.NewTicker(staleTimeout / 4)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			if time.Since(time.Unix(0, lastFrame.Load())) > staleTimeout {
+				cancel()
+				return
+			}
 		}
 	}
 }

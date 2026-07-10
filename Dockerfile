@@ -10,19 +10,26 @@ COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . .
+
+# CI gate: `docker build --target test .` runs vet + tests and produces no image.
+FROM build AS test
+RUN go vet ./... && go test ./...
+
+FROM build AS compile
 # CGO off → fully static binaries (no libc at runtime). Our deps are pure Go
 # (nats.go, coder/websocket), so nothing needs cgo.
 RUN CGO_ENABLED=0 GOOS=linux go build -o /out/market-data ./services/market-data \
  && CGO_ENABLED=0 GOOS=linux go build -o /out/strategy    ./services/strategy \
  && CGO_ENABLED=0 GOOS=linux go build -o /out/order        ./services/order \
- && CGO_ENABLED=0 GOOS=linux go build -o /out/portfolio    ./services/portfolio
+ && CGO_ENABLED=0 GOOS=linux go build -o /out/portfolio    ./services/portfolio \
+ && CGO_ENABLED=0 GOOS=linux go build -o /out/notification ./services/notification
 
 FROM alpine:3.21
 # ca-certificates: outbound TLS to Bybit (wss:// market data, https:// REST)
 # needs the system CA bundle, which the scratch/distroless-free alpine lacks.
 RUN apk add --no-cache ca-certificates
-COPY --from=build /out/ /usr/local/bin/
+COPY --from=compile /out/ /usr/local/bin/
 
 # No ENTRYPOINT on purpose: each compose service sets `command` to one of
-# market-data | strategy | order | portfolio, all resolvable on PATH from
-# /usr/local/bin.
+# market-data | strategy | order | portfolio | notification, all resolvable
+# on PATH from /usr/local/bin.

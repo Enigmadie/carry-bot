@@ -150,9 +150,11 @@ type service struct {
 	ex  exchange.Exchange
 	cfg config
 
-	// halted is set once, during startup reconciliation, before the consumer
-	// starts — an unbalanced exchange position must be fixed by a human, and
-	// until then every intent is dropped instead of trading on top of it.
+	// halted stops all trading until a human fixes the exchange position: set at
+	// startup reconciliation (unbalanced snapshot) or at runtime by alert() (a
+	// failed rollback / half-closed pair). Every intent is dropped while set; the
+	// only way out is a restart that reconciles clean. Written and read solely on
+	// the intent worker goroutine (startup runs before the consumer starts).
 	halted bool
 
 	// positionOpen mirrors whether the pair is currently held. Written by the
@@ -433,6 +435,14 @@ func (s *service) handle(ctx context.Context, m jetstream.Msg) {
 	}
 
 	if errors.Is(err, errRetry) {
+		// On the final delivery a nak is a silent drop: JetStream won't redeliver
+		// past MaxDeliver, and strategy would wait forever in pending for a fact
+		// that never comes. Emit exec.failed so the drop is a recorded outcome.
+		if md, mdErr := m.Metadata(); mdErr == nil && md.NumDelivered >= maxDeliver {
+			s.emitFailed(ctx, intent, "retries exhausted: "+err.Error())
+			m.Term()
+			return
+		}
 		s.log.Warn("transient failure, will retry", "id", intent.ID, "err", err)
 		m.Nak()
 		return
@@ -678,12 +688,16 @@ func (s *service) emitFailed(ctx context.Context, in events.Intent, reason strin
 	intentsTotal.WithLabelValues(in.Side, "failed").Inc()
 }
 
-// alert is a failure we cannot resolve automatically. Until notification-service
-// exists the alert is a loud log plus a durable exec.failed fact, which is
-// enough to wake someone via a Grafana/Prometheus alert later.
+// alert is a failure we cannot resolve automatically — the exchange position is
+// no longer the clean pair (naked spot after a failed rollback, or a half-closed
+// position). Trading on top of that would compound the damage, so it halts the
+// service the same way an unbalanced startup reconcile does; the exec.failed
+// fact carries the reason downstream (notification-service relays it).
 func (s *service) alert(ctx context.Context, in events.Intent, reason string) {
 	alertsTotal.Inc()
-	s.log.Error("ALERT", "id", in.ID, "reason", reason)
+	s.halted = true
+	haltedGauge.Set(1)
+	s.log.Error("ALERT: halting trading", "id", in.ID, "reason", reason)
 	s.emitFailed(ctx, in, reason)
 }
 
