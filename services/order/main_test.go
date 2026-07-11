@@ -30,3 +30,27 @@ func TestClassifyState(t *testing.T) {
 		}
 	}
 }
+
+func TestIsOrphanSpot(t *testing.T) {
+	const qty = 1.0
+	cases := []struct {
+		name string
+		st   exchange.PositionState
+		want bool
+	}{
+		{"perp ADLed, spot whole", exchange.PositionState{SpotSize: 1.0}, true},
+		{"spot fee taken in base", exchange.PositionState{SpotSize: 0.9993}, true},
+		{"spot with fee dust on top", exchange.PositionState{SpotSize: 1.0079}, true},
+		{"residual perp dust", exchange.PositionState{PerpSize: -0.05, SpotSize: 1.0}, true},
+		{"spot above tolerance — not our position", exchange.PositionState{SpotSize: 1.2}, false},
+		{"partial spot", exchange.PositionState{SpotSize: 0.5}, false},
+		{"perp still held", exchange.PositionState{PerpSize: -1.0, SpotSize: 1.0}, false},
+		{"perp long", exchange.PositionState{PerpSize: 1.0, SpotSize: 1.0}, false},
+		{"resting order", exchange.PositionState{SpotSize: 1.0, OpenOrders: 1}, false},
+	}
+	for _, tc := range cases {
+		if got := isOrphanSpot(&tc.st, qty); got != tc.want {
+			t.Errorf("%s: isOrphanSpot(%+v) = %v, want %v", tc.name, tc.st, got, tc.want)
+		}
+	}
+}

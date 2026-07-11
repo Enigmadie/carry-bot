@@ -122,6 +122,12 @@ func New(cfg Config) (*Client, error) {
 	return c, nil
 }
 
+// AccountAddress is the address user-scoped queries and WS subscriptions target
+// (explicit master → vault → signing key's own address), as a 0x-hex string.
+func (c *Client) AccountAddress() string {
+	return c.account.Hex()
+}
+
 // info POSTs an unsigned request to /info and decodes the result into out. The
 // request body is a JSON object whose "type" selects the query (e.g. "meta").
 func (c *Client) info(ctx context.Context, req any, out any) error {

@@ -330,10 +330,23 @@ func cloidFromLinkID(linkID string) string {
 	return "0x" + hex.EncodeToString(h[:16])
 }
 
-// formatSize rounds a size to the instrument's szDecimals and renders it without
-// trailing zeros, the wire form Hyperliquid expects.
+// formatSize truncates a size to the instrument's szDecimals and renders it
+// without trailing zeros, the wire form Hyperliquid expects. Truncation, not
+// rounding: sizes derived from a live balance (the orphan-spot auto-close sells
+// what the account actually holds) must never round up past that balance. Done
+// on the decimal string so float artifacts can't nudge the value either way.
 func formatSize(sz float64, szDecimals int) string {
-	return trimZeros(strconv.FormatFloat(sz, 'f', szDecimals, 64))
+	s := strconv.FormatFloat(sz, 'f', -1, 64)
+	if i := strings.Index(s, "."); i >= 0 {
+		max := i + 1 + szDecimals
+		if szDecimals == 0 {
+			max = i
+		}
+		if len(s) > max {
+			s = s[:max]
+		}
+	}
+	return trimZeros(s)
 }
 
 // formatPrice applies Hyperliquid's two price rules: at most 5 significant figures

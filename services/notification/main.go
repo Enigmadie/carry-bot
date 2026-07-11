@@ -218,13 +218,19 @@ func format(subject string, data []byte) (kind, text string, err error) {
 	if err := json.Unmarshal(data, &r); err != nil {
 		return "exec", "", err
 	}
+	// Reason is set when the fact happened without an intent (orphan auto-close)
+	// — exactly when the reader needs to know why.
+	reason := ""
+	if r.Reason != "" {
+		reason = "\n" + r.Reason
+	}
 	switch subject {
 	case events.SubjPositionOpened:
 		return "opened", fmt.Sprintf("🟢 OPENED %s qty=%v\nspot=%v perp=%v fee=%v",
-			r.Symbol, r.Qty, r.SpotPrice, r.PerpPrice, r.Fee), nil
+			r.Symbol, r.Qty, r.SpotPrice, r.PerpPrice, r.Fee) + reason, nil
 	case events.SubjPositionClosed:
 		return "closed", fmt.Sprintf("⚪ CLOSED %s qty=%v\nspot=%v perp=%v fee=%v",
-			r.Symbol, r.Qty, r.SpotPrice, r.PerpPrice, r.Fee), nil
+			r.Symbol, r.Qty, r.SpotPrice, r.PerpPrice, r.Fee) + reason, nil
 	case events.SubjExecFailed:
 		return "failed", fmt.Sprintf("⚠️ FAILED %s %s\n%s", r.Side, r.Symbol, r.Error), nil
 	default:

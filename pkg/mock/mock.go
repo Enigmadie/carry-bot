@@ -40,7 +40,8 @@ var (
 )
 
 type Exchange struct {
-	failCategory string // CategorySpot | CategoryLinear | "" — leg to fail, for rollback testing
+	failCategory string        // CategorySpot | CategoryLinear | "" — leg to fail, for rollback testing
+	adlAfter     time.Duration // >0: force-close the perp this long after it opens (ADL simulation)
 
 	mu       sync.Mutex
 	seen     map[string]string // orderLinkId -> orderId
@@ -49,14 +50,18 @@ type Exchange struct {
 	// Live position, mutated by fills, so State reflects what was traded — the
 	// same contract a real exchange gives reconciliation. In-memory like the
 	// rest of the mock: a restart forgets it and reconciles as flat.
-	perpSize float64 // signed; our short goes negative
-	spotSize float64
+	perpSize   float64 // signed; our short goes negative
+	spotSize   float64
+	perpOpenAt time.Time // when the short opened; adlAfter counts from here
 }
 
 // New builds a mock. failCategory ("spot"/"linear"/"") forces that leg to fail
-// terminally so callers can exercise rollback/unbalanced handling.
-func New(failCategory string) *Exchange {
-	return &Exchange{failCategory: failCategory, seen: map[string]string{}}
+// terminally so callers can exercise rollback/unbalanced handling. adlAfter > 0
+// simulates the exchange force-closing the perp (Auto-Deleveraging) that long
+// after it opens — the spot leg stays, exactly the orphaned shape runtime
+// reconciliation must catch.
+func New(failCategory string, adlAfter time.Duration) *Exchange {
+	return &Exchange{failCategory: failCategory, adlAfter: adlAfter, seen: map[string]string{}}
 }
 
 func (m *Exchange) PlaceOrder(_ context.Context, req exchange.OrderRequest) (*exchange.OrderResult, error) {
@@ -78,7 +83,11 @@ func (m *Exchange) PlaceOrder(_ context.Context, req exchange.OrderRequest) (*ex
 		delta = -qty
 	}
 	if req.Category == exchange.CategoryLinear {
+		wasFlat := m.perpSize == 0
 		m.perpSize += delta
+		if wasFlat && m.perpSize < 0 {
+			m.perpOpenAt = time.Now()
+		}
 	} else {
 		m.spotSize += delta
 	}
@@ -113,6 +122,11 @@ func (m *Exchange) Funding(_ context.Context, symbol string, _ time.Time) ([]exc
 func (m *Exchange) State(_ context.Context, _ string) (*exchange.PositionState, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	// ADL happens on the exchange's clock, not through PlaceOrder, so it is
+	// applied lazily here — State is how the drift becomes observable anyway.
+	if m.adlAfter > 0 && m.perpSize < 0 && time.Since(m.perpOpenAt) >= m.adlAfter {
+		m.perpSize = 0
+	}
 	return &exchange.PositionState{
 		PerpSize:   m.perpSize,
 		SpotSize:   m.spotSize,

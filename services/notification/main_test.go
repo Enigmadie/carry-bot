@@ -27,6 +27,10 @@ func TestFormat(t *testing.T) {
 	clean, _ := json.Marshal(events.Reconciled{
 		Symbol: "HYPEUSDC", Verdict: events.ReconcileFlat,
 	})
+	orphanClosed, _ := json.Marshal(events.ExecReport{
+		Symbol: "HYPEUSDC", Side: events.IntentClose, Qty: 1,
+		Reason: "orphaned spot auto-closed: perp force-closed by exchange (ADL/liquidation)",
+	})
 
 	cases := []struct {
 		subject  string
@@ -36,6 +40,7 @@ func TestFormat(t *testing.T) {
 	}{
 		{events.SubjPositionOpened, report, "opened", "OPENED HYPEUSDC"},
 		{events.SubjPositionClosed, report, "closed", "CLOSED HYPEUSDC"},
+		{events.SubjPositionClosed, orphanClosed, "closed", "orphaned spot auto-closed"},
 		{events.SubjExecFailed, report, "failed", "spot leg failed: boom"},
 		{events.SubjReconciled, unbalanced, "reconciled", "UNBALANCED HYPEUSDC"},
 		{events.SubjReconciled, clean, "reconciled", ""},

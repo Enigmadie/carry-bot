@@ -14,10 +14,14 @@ func TestFormatSize(t *testing.T) {
 		szDecimals int
 		want       string
 	}{
-		{0.0012349, 5, "0.00123"}, // rounds to szDecimals places
+		{0.0012349, 5, "0.00123"}, // truncates to szDecimals places
 		{1.5, 5, "1.5"},           // trailing zeros trimmed
 		{2.0, 3, "2"},             // integer collapses, no dangling dot
 		{0.001, 3, "0.001"},
+		{1.0079, 2, "1"}, // balance-derived size truncates down, never up
+		{0.0019, 3, "0.001"},
+		{4.6, 1, "4.6"}, // float artifact (4.5999…96) must not truncate to 4.5
+		{4.6, 0, "4"},
 	}
 	for _, tc := range cases {
 		if got := formatSize(tc.sz, tc.szDecimals); got != tc.want {

@@ -24,6 +24,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"os"
 	"os/signal"
 	"strconv"
@@ -90,6 +91,22 @@ var (
 		Namespace: metrics.Namespace, Subsystem: "order",
 		Name: "halted", Help: "1 when trading is halted (unbalanced position at reconcile); manual intervention required.",
 	})
+	reconcileDriftTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metrics.Namespace, Subsystem: "order",
+		Name: "reconcile_drift_total", Help: "Runtime reconcile ticks where the exchange disagreed with internal state, by verdict.",
+	}, []string{"verdict"})
+	orphanClosesTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: metrics.Namespace, Subsystem: "order",
+		Name: "orphan_closes_total", Help: "Orphaned spot legs auto-closed after the exchange force-closed the perp.",
+	})
+	userWSReconnects = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: metrics.Namespace, Subsystem: "order",
+		Name: "user_ws_reconnects_total", Help: "User-fills WebSocket reconnects.",
+	})
+	userWSNudges = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: metrics.Namespace, Subsystem: "order",
+		Name: "user_ws_nudges_total", Help: "Reconciles triggered by a user fill the bot did not place.",
+	})
 )
 
 type config struct {
@@ -98,14 +115,18 @@ type config struct {
 	Provider string // EXCHANGE: mock | bybit | hyperliquid
 	OrderQty string // base-coin amount per leg; intents carry no size
 
-	FundingPoll time.Duration // how often to poll the exchange for funding; 0 disables
+	FundingPoll     time.Duration // how often to poll the exchange for funding; 0 disables
+	ReconcilePoll   time.Duration // how often to re-check exchange state at runtime; 0 disables
+	OrphanAutoClose bool          // sell an orphaned spot leg (perp force-closed by exchange) instead of halting
 
-	BybitREST   string
-	APIKey      string
-	APISecret   string
-	MockFailLeg string // mock only: category whose leg fails, for rollback testing
+	BybitREST    string
+	APIKey       string
+	APISecret    string
+	MockFailLeg  string        // mock only: category whose leg fails, for rollback testing
+	MockADLAfter time.Duration // mock only: force-close the perp this long after open (ADL simulation)
 
 	HLAPI        string  // hyperliquid REST host; "" → testnet
+	HLWS         string  // hyperliquid WS host for user fills; "" → follows HLMainnet
 	HLMainnet    bool    // hyperliquid: phantom-agent source; must match HLAPI
 	HLPrivateKey string  // hyperliquid agent-wallet signing key
 	HLVault      string  // hyperliquid: optional vault/sub-account address
@@ -124,14 +145,18 @@ func loadConfig() config {
 		Provider: getenv("EXCHANGE", "mock"),
 		OrderQty: getenv("ORDER_QTY", "0.001"),
 
-		FundingPoll: getdur("FUNDING_POLL", 30*time.Second),
+		FundingPoll:     getdur("FUNDING_POLL", 30*time.Second),
+		ReconcilePoll:   getdur("RECONCILE_POLL", time.Minute),
+		OrphanAutoClose: getbool("ORPHAN_AUTO_CLOSE", true),
 
-		BybitREST:   getenv("BYBIT_REST", bybit.TestnetREST),
-		APIKey:      os.Getenv("BYBIT_API_KEY"),
-		APISecret:   os.Getenv("BYBIT_API_SECRET"),
-		MockFailLeg: os.Getenv("MOCK_FAIL_LEG"),
+		BybitREST:    getenv("BYBIT_REST", bybit.TestnetREST),
+		APIKey:       os.Getenv("BYBIT_API_KEY"),
+		APISecret:    os.Getenv("BYBIT_API_SECRET"),
+		MockFailLeg:  os.Getenv("MOCK_FAIL_LEG"),
+		MockADLAfter: getdur("MOCK_ADL_AFTER", 0),
 
 		HLAPI:        os.Getenv("HL_API"),
+		HLWS:         os.Getenv("HL_WS"),
 		HLMainnet:    getbool("HL_MAINNET", false),
 		HLPrivateKey: os.Getenv("HL_PRIVATE_KEY"),
 		HLVault:      os.Getenv("HL_VAULT"),
@@ -162,6 +187,13 @@ type service struct {
 	// own goroutine — hence atomic. It gates funding emission so the ledger
 	// doesn't accumulate unattached payments while flat.
 	positionOpen atomic.Bool
+
+	// nudge carries the dir of a user fill the bot did not place (ADL,
+	// liquidation, a manual order), sent by the user-fills WS watcher
+	// (userfills.go) to trigger an immediate reconcile on the worker loop.
+	// Buffered 1 + non-blocking send: coalescing bursts is fine, one reconcile
+	// covers them all.
+	nudge chan string
 }
 
 // buildExchange selects the provider from config. mock-first: the default needs no
@@ -171,7 +203,7 @@ type service struct {
 func buildExchange(ctx context.Context, cfg config) (exchange.Exchange, error) {
 	switch cfg.Provider {
 	case "mock":
-		return mock.New(cfg.MockFailLeg), nil
+		return mock.New(cfg.MockFailLeg, cfg.MockADLAfter), nil
 	case "bybit":
 		if cfg.APIKey == "" || cfg.APISecret == "" {
 			return nil, errors.New("EXCHANGE=bybit requires BYBIT_API_KEY and BYBIT_API_SECRET")
@@ -249,10 +281,11 @@ func main() {
 	}
 
 	s := &service{
-		log: log,
-		js:  js,
-		ex:  ex,
-		cfg: cfg,
+		log:   log,
+		js:    js,
+		ex:    ex,
+		cfg:   cfg,
+		nudge: make(chan string, 1),
 	}
 
 	if err := s.run(ctx); err != nil && ctx.Err() == nil {
@@ -316,12 +349,35 @@ func (s *service) run(ctx context.Context) error {
 	// than the intent consumer. It runs alongside the worker; both unwind on ctx.
 	go s.pollFunding(ctx)
 
+	// The fast lane of runtime reconciliation: user fills we didn't place nudge
+	// an immediate reconcile instead of waiting out the poll interval. Only
+	// hyperliquid has the feed; everywhere else the poll alone carries it.
+	if hc, ok := s.ex.(*hyperliquid.Client); ok {
+		go s.watchUserFills(ctx, userWSURL(s.cfg), hc.AccountAddress())
+	}
+
+	// The runtime reconcile ticks on the worker loop itself, not a goroutine:
+	// it reads and writes the same state as intent handling (halted,
+	// positionOpen) and must never observe the exchange mid-leg.
+	var recTick <-chan time.Time
+	if s.cfg.ReconcilePoll > 0 {
+		t := time.NewTicker(s.cfg.ReconcilePoll)
+		defer t.Stop()
+		recTick = t.C
+		s.log.Info("runtime reconcile enabled", "every", s.cfg.ReconcilePoll)
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case m := <-msgs:
 			s.handle(ctx, m)
+		case <-recTick:
+			s.reconcileTick(ctx)
+		case dir := <-s.nudge:
+			s.log.Warn("user fill outside our orders, reconciling now", "dir", dir)
+			s.reconcileTick(ctx)
 		}
 	}
 }
@@ -358,17 +414,135 @@ func classifyState(st *exchange.PositionState, qty float64) string {
 	}
 }
 
+// isOrphanSpot matches the one unbalanced shape the exchange can create
+// without another actor: ADL/liquidation force-closed the perp short, the spot
+// leg is intact within the same tolerances an open leg is judged by (a small
+// upper margin covers accumulated fee dust), and nothing is resting. Every
+// other unbalanced shape implies a human or a bug and stays on the halt path.
+func isOrphanSpot(st *exchange.PositionState, qty float64) bool {
+	return st.OpenOrders == 0 &&
+		math.Abs(st.PerpSize) <= qty*legDustFraction &&
+		st.SpotSize >= qty*legFullFraction &&
+		st.SpotSize <= qty*(1+legDustFraction)
+}
+
+// observeState reads and classifies the live position. An unbalanced verdict
+// that is exactly the orphaned-spot shape gets repaired in place (unless
+// ORPHAN_AUTO_CLOSE opted out); the caller then sees the refreshed state, and
+// a failed repair falls through as the original unbalanced verdict → halt.
+func (s *service) observeState(ctx context.Context) (*exchange.PositionState, string, error) {
+	st, err := s.ex.State(ctx, s.cfg.Symbol)
+	if err != nil {
+		return nil, "", err
+	}
+	verdict := classifyState(st, s.qty())
+	if verdict == events.ReconcileUnbalanced && s.cfg.OrphanAutoClose && isOrphanSpot(st, s.qty()) {
+		if fresh, ok := s.autoCloseOrphan(ctx, st); ok {
+			st = fresh
+			verdict = classifyState(st, s.qty())
+		}
+	}
+	return st, verdict, nil
+}
+
+// autoCloseOrphan sells the orphaned spot leg to bring the account back to
+// flat — the one trade the bot makes without an intent. Selling the held
+// balance can only reduce exposure; the closed fact settles portfolio's ledger
+// and walks strategy to flat. The exact balance is sold (the provider
+// truncates it to the instrument's lot size), which also sweeps accumulated
+// fee dust.
+func (s *service) autoCloseOrphan(ctx context.Context, st *exchange.PositionState) (*exchange.PositionState, bool) {
+	linkID := fmt.Sprintf("orphan-close-%d", time.Now().UTC().UnixNano())
+	s.log.Warn("orphaned spot leg — perp force-closed by exchange, auto-closing",
+		"spot", st.SpotSize, "link", linkID)
+	res, err := s.placeLeg(ctx, events.Intent{ID: linkID}, exchange.OrderRequest{
+		Category:    exchange.CategorySpot,
+		Symbol:      s.cfg.Symbol,
+		Side:        exchange.SideSell,
+		Qty:         strconv.FormatFloat(st.SpotSize, 'f', -1, 64),
+		OrderLinkID: linkID,
+	})
+	if err != nil {
+		s.log.Error("orphan auto-close failed, falling back to halt", "err", err)
+		return nil, false
+	}
+	orphanClosesTotal.Inc()
+	s.emit(ctx, events.SubjPositionClosed, events.ExecReport{
+		IntentID: linkID, Symbol: s.cfg.Symbol, Side: events.IntentClose, Qty: st.SpotSize,
+		SpotOrderID: res.OrderID, SpotPrice: res.Price, Fee: res.Fee,
+		Reason: "orphaned spot auto-closed: perp force-closed by exchange (ADL/liquidation)",
+		Time:   time.Now().UTC(),
+	})
+	fresh, err := s.ex.State(ctx, s.cfg.Symbol)
+	if err != nil {
+		// Sold but can't confirm — report failure so the caller halts on the old
+		// snapshot; the restart's clean reconcile will see the flat truth.
+		s.log.Error("orphan auto-close: re-read state", "err", err)
+		return nil, false
+	}
+	s.log.Info("orphaned spot auto-closed", "sold", st.SpotSize, "spot_left", fresh.SpotSize)
+	return fresh, true
+}
+
 // reconcile reads the live position from the exchange, publishes the snapshot
 // as a durable exec.reconciled fact (strategy seeds its state machine from it,
 // portfolio checks its ledger against it), and arms the local flags: the
 // funding gate on an open position, the halt on an unbalanced one.
 func (s *service) reconcile(ctx context.Context) error {
-	st, err := s.ex.State(ctx, s.cfg.Symbol)
+	st, verdict, err := s.observeState(ctx)
 	if err != nil {
 		return err
 	}
-	verdict := classifyState(st, s.qty())
+	if err := s.publishReconciled(ctx, st, verdict); err != nil {
+		return err
+	}
+	s.applyVerdict(st, verdict)
+	s.log.Info("reconciled against exchange", "verdict", verdict,
+		"perp", st.PerpSize, "spot", st.SpotSize,
+		"collateral", st.Collateral, "open_orders", st.OpenOrders)
+	return nil
+}
 
+// reconcileTick is the runtime safety loop: the exchange can change our
+// position without an order from us (ADL, liquidation), and the WS feed can
+// silently miss it — polling catches any drift regardless of events. It only
+// publishes on disagreement, so the EXEC stream doesn't fill with no-op
+// snapshots. While halted the tick idles: the position needs a human, and the
+// only exit is a restart with a clean startup reconcile.
+func (s *service) reconcileTick(ctx context.Context) {
+	if s.halted {
+		return
+	}
+	st, verdict, err := s.observeState(ctx)
+	if err != nil {
+		// Transient by assumption: unlike startup we already hold trusted state,
+		// so keep trading on it and let the next tick retry.
+		s.log.Warn("runtime reconcile: read state", "err", err)
+		return
+	}
+	want := events.ReconcileFlat
+	if s.positionOpen.Load() {
+		want = events.ReconcileOpen
+	}
+	if verdict == want {
+		return
+	}
+
+	reconcileDriftTotal.WithLabelValues(verdict).Inc()
+	s.log.Error("runtime reconcile: exchange disagrees with internal state",
+		"internal", want, "verdict", verdict,
+		"perp", st.PerpSize, "spot", st.SpotSize, "open_orders", st.OpenOrders)
+	// Publish before applying: the snapshot is what walks strategy back to the
+	// exchange's truth, so a failed publish must be retried — leaving local
+	// state as-is keeps the drift visible to the next tick.
+	if err := s.publishReconciled(ctx, st, verdict); err != nil {
+		s.log.Error("runtime reconcile: publish", "err", err)
+		return
+	}
+	s.applyVerdict(st, verdict)
+}
+
+func (s *service) publishReconciled(ctx context.Context, st *exchange.PositionState, verdict string) error {
 	rep := events.Reconciled{
 		Symbol: s.cfg.Symbol, Verdict: verdict,
 		PerpSize: st.PerpSize, SpotSize: st.SpotSize,
@@ -379,16 +553,24 @@ func (s *service) reconcile(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("marshal reconciled: %w", err)
 	}
-	// Every startup is a distinct snapshot, so the dedup id carries the
-	// timestamp — two restarts inside the dedup window must both be seen.
+	// Every snapshot is distinct, so the dedup id carries the timestamp — two
+	// snapshots inside the dedup window must both be seen.
 	msgID := fmt.Sprintf("reconciled:%d", rep.Time.UnixNano())
 	if _, err := s.js.Publish(ctx, events.SubjReconciled, data, jetstream.WithMsgID(msgID)); err != nil {
 		return fmt.Errorf("publish reconciled: %w", err)
 	}
+	return nil
+}
 
+// applyVerdict arms the local flags from a published snapshot: the funding
+// gate follows the position, an unbalanced position halts trading. Runs only
+// on the worker goroutine (startup runs before the consumer starts).
+func (s *service) applyVerdict(st *exchange.PositionState, verdict string) {
 	switch verdict {
 	case events.ReconcileOpen:
 		s.positionOpen.Store(true)
+	case events.ReconcileFlat:
+		s.positionOpen.Store(false)
 	case events.ReconcileUnbalanced:
 		s.halted = true
 		haltedGauge.Set(1)
@@ -396,10 +578,6 @@ func (s *service) reconcile(ctx context.Context) error {
 		s.log.Error("ALERT: exchange position unbalanced at reconcile — halting, manual intervention required",
 			"perp", st.PerpSize, "spot", st.SpotSize, "open_orders", st.OpenOrders)
 	}
-	s.log.Info("reconciled against exchange", "verdict", verdict,
-		"perp", st.PerpSize, "spot", st.SpotSize,
-		"collateral", st.Collateral, "open_orders", st.OpenOrders)
-	return nil
 }
 
 // handle processes one intent and settles its JetStream delivery: ack on a

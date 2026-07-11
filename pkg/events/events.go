@@ -76,8 +76,9 @@ type ExecReport struct {
 	PerpOrderID string    `json:"perp_order_id,omitempty"`
 	SpotPrice   float64   `json:"spot_price,omitempty"` // fill prices/fees per leg, for portfolio P&L
 	PerpPrice   float64   `json:"perp_price,omitempty"`
-	Fee         float64   `json:"fee,omitempty"`   // total fee across both legs, quote currency
-	Error       string    `json:"error,omitempty"` // set on SubjExecFailed
+	Fee         float64   `json:"fee,omitempty"`    // total fee across both legs, quote currency
+	Error       string    `json:"error,omitempty"`  // set on SubjExecFailed
+	Reason      string    `json:"reason,omitempty"` // why this happened without an intent (e.g. orphan auto-close)
 	Time        time.Time `json:"time"`
 }
 
@@ -89,8 +90,10 @@ const (
 )
 
 // Reconciled is a snapshot of the exchange's live position, emitted by
-// order-service at startup after comparing it against the configured order
-// size. It is the single point where exchange truth enters the event flow:
+// order-service after comparing it against the configured order size: at every
+// startup, and at runtime when the periodic reconcile sees the exchange
+// disagree with internal state (e.g. a position force-closed by ADL). It is
+// the single point where exchange truth enters the event flow:
 // strategy initialises its state machine from it and portfolio checks its
 // ledger against it. An unbalanced verdict means order-service is halted.
 type Reconciled struct {
