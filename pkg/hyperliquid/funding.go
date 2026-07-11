@@ -70,10 +70,25 @@ func (c *Client) Funding(ctx context.Context, symbol string, since time.Time) ([
 
 // fundingID is the dedup key downstream books on. Hyperliquid has no single
 // settlement id, so we compose the event hash with the coin (one hash can settle
-// several coins) — stable across redelivery. Falls back to time+coin if no hash.
+// several coins) — stable across redelivery. Live HL sends the zero hash on
+// funding settlements (no on-chain tx) — every payment would collide on one id
+// and the ledger PK would silently drop all but the first, so an absent OR
+// all-zero hash falls back to time+coin (funding is at most hourly per coin).
 func fundingID(e userFundingEntry) string {
-	if e.Hash != "" {
+	if e.Hash != "" && !zeroHash(e.Hash) {
 		return e.Hash + ":" + e.Delta.Coin
 	}
 	return strconv.FormatInt(e.Time, 10) + ":" + e.Delta.Coin
+}
+
+func zeroHash(h string) bool {
+	if len(h) <= 2 || (h[:2] != "0x" && h[:2] != "0X") {
+		return false
+	}
+	for _, c := range h[2:] {
+		if c != '0' {
+			return false
+		}
+	}
+	return true
 }
