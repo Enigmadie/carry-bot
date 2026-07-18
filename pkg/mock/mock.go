@@ -53,13 +53,21 @@ type Exchange struct {
 	perpSize   float64 // signed; our short goes negative
 	spotSize   float64
 	perpOpenAt time.Time // when the short opened; adlAfter counts from here
+	adlBitten  bool      // first (partial) ADL bite applied; keeps the bite idempotent
 }
+
+// adlPartialFraction is what remains of the perp after the first ADL bite — a
+// shape that is neither an open leg nor dust, so reconciliation must judge it
+// unbalanced (the live incidents left −0.29 of 1).
+const adlPartialFraction = 0.3
 
 // New builds a mock. failCategory ("spot"/"linear"/"") forces that leg to fail
 // terminally so callers can exercise rollback/unbalanced handling. adlAfter > 0
-// simulates the exchange force-closing the perp (Auto-Deleveraging) that long
-// after it opens — the spot leg stays, exactly the orphaned shape runtime
-// reconciliation must catch.
+// simulates the exchange force-closing the perp (Auto-Deleveraging) in two
+// bites, the way the live incidents played out: adlAfter after the short opens
+// a partial bite leaves an unbalanced stub (→ halt), and 2×adlAfter finishes
+// the perp off, leaving the orphaned spot the halted tick must catch and
+// repair.
 func New(failCategory string, adlAfter time.Duration) *Exchange {
 	return &Exchange{failCategory: failCategory, adlAfter: adlAfter, seen: map[string]string{}}
 }
@@ -87,6 +95,7 @@ func (m *Exchange) PlaceOrder(_ context.Context, req exchange.OrderRequest) (*ex
 		m.perpSize += delta
 		if wasFlat && m.perpSize < 0 {
 			m.perpOpenAt = time.Now()
+			m.adlBitten = false
 		}
 	} else {
 		m.spotSize += delta
@@ -124,8 +133,14 @@ func (m *Exchange) State(_ context.Context, _ string) (*exchange.PositionState, 
 	defer m.mu.Unlock()
 	// ADL happens on the exchange's clock, not through PlaceOrder, so it is
 	// applied lazily here — State is how the drift becomes observable anyway.
-	if m.adlAfter > 0 && m.perpSize < 0 && time.Since(m.perpOpenAt) >= m.adlAfter {
-		m.perpSize = 0
+	if m.adlAfter > 0 && m.perpSize < 0 {
+		switch elapsed := time.Since(m.perpOpenAt); {
+		case elapsed >= 2*m.adlAfter:
+			m.perpSize = 0
+		case elapsed >= m.adlAfter && !m.adlBitten:
+			m.perpSize *= adlPartialFraction
+			m.adlBitten = true
+		}
 	}
 	return &exchange.PositionState{
 		PerpSize:   m.perpSize,

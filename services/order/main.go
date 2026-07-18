@@ -175,12 +175,19 @@ type service struct {
 	ex  exchange.Exchange
 	cfg config
 
-	// halted stops all trading until a human fixes the exchange position: set at
+	// halted stops all trading until the exchange position is clean again: set at
 	// startup reconciliation (unbalanced snapshot) or at runtime by alert() (a
-	// failed rollback / half-closed pair). Every intent is dropped while set; the
-	// only way out is a restart that reconciles clean. Written and read solely on
-	// the intent worker goroutine (startup runs before the consumer starts).
+	// failed rollback / half-closed pair). Every intent is dropped while set. The
+	// halt lifts on a restart that reconciles clean, or when a halted tick
+	// observes the account provably flat (see haltedTick). Written and read
+	// solely on the intent worker goroutine (startup runs before the consumer
+	// starts).
 	halted bool
+
+	// haltedShape is the last exchange shape published while halted, so halted
+	// ticks report each *change* of the position exactly once instead of either
+	// going blind or re-alerting the same unbalanced state every tick.
+	haltedShape string
 
 	// positionOpen mirrors whether the pair is currently held. Written by the
 	// intent worker (reconcile/opened/closed), read by the funding poller on its
@@ -507,10 +514,11 @@ func (s *service) reconcile(ctx context.Context) error {
 // position without an order from us (ADL, liquidation), and the WS feed can
 // silently miss it — polling catches any drift regardless of events. It only
 // publishes on disagreement, so the EXEC stream doesn't fill with no-op
-// snapshots. While halted the tick idles: the position needs a human, and the
-// only exit is a restart with a clean startup reconcile.
+// snapshots. While halted the tick keeps watching read-only (haltedTick): the
+// exchange doesn't stop moving just because we did.
 func (s *service) reconcileTick(ctx context.Context) {
 	if s.halted {
+		s.haltedTick(ctx)
 		return
 	}
 	st, verdict, err := s.observeState(ctx)
@@ -540,6 +548,57 @@ func (s *service) reconcileTick(ctx context.Context) {
 		return
 	}
 	s.applyVerdict(st, verdict)
+}
+
+// haltedTick keeps a halt observable instead of blind. The 2026-07-13 incident:
+// a partial liquidation halted trading, then the exchange finished off the perp
+// — and the halted bot neither saw it, nor reported it, nor repaired the
+// resulting orphaned spot. So while halted the tick still observes the
+// exchange, with two deliberate reactions and nothing else:
+//
+//   - Each *change* of the exchange's shape is published as exec.reconciled
+//     (notification relays unbalanced ones), gated by haltedShape so a static
+//     position doesn't re-alert every tick.
+//   - observeState may repair an orphaned spot leg even now — selling it can
+//     only reduce exposure — and a verdict that comes back flat lifts the halt:
+//     a provably empty account is safe to trade from. This is the agreed
+//     weakening of "a halt exits only via restart"; every other shape keeps the
+//     halt and keeps waiting.
+func (s *service) haltedTick(ctx context.Context) {
+	st, verdict, err := s.observeState(ctx)
+	if err != nil {
+		s.log.Warn("halted reconcile: read state", "err", err)
+		return
+	}
+	if verdict == events.ReconcileFlat {
+		if err := s.publishReconciled(ctx, st, verdict); err != nil {
+			s.log.Error("halted reconcile: publish", "err", err)
+			return
+		}
+		s.halted = false
+		s.haltedShape = ""
+		haltedGauge.Set(0)
+		s.applyVerdict(st, verdict)
+		s.log.Info("halt lifted: exchange is flat",
+			"perp", st.PerpSize, "spot", st.SpotSize, "collateral", st.Collateral)
+		return
+	}
+	shape := haltShape(st, verdict)
+	if shape == s.haltedShape {
+		return
+	}
+	s.log.Error("halted: exchange position changed", "verdict", verdict,
+		"perp", st.PerpSize, "spot", st.SpotSize, "open_orders", st.OpenOrders)
+	if err := s.publishReconciled(ctx, st, verdict); err != nil {
+		s.log.Error("halted reconcile: publish", "err", err)
+		return
+	}
+	s.haltedShape = shape
+}
+
+// haltShape fingerprints an exchange snapshot for the halted change-gate.
+func haltShape(st *exchange.PositionState, verdict string) string {
+	return fmt.Sprintf("%s|%v|%v|%d", verdict, st.PerpSize, st.SpotSize, st.OpenOrders)
 }
 
 func (s *service) publishReconciled(ctx context.Context, st *exchange.PositionState, verdict string) error {
@@ -573,6 +632,9 @@ func (s *service) applyVerdict(st *exchange.PositionState, verdict string) {
 		s.positionOpen.Store(false)
 	case events.ReconcileUnbalanced:
 		s.halted = true
+		// Seed the change-gate with the shape that caused the halt: it was just
+		// published, so the first halted tick stays quiet until something moves.
+		s.haltedShape = haltShape(st, verdict)
 		haltedGauge.Set(1)
 		alertsTotal.Inc()
 		s.log.Error("ALERT: exchange position unbalanced at reconcile — halting, manual intervention required",
@@ -874,6 +936,9 @@ func (s *service) emitFailed(ctx context.Context, in events.Intent, reason strin
 func (s *service) alert(ctx context.Context, in events.Intent, reason string) {
 	alertsTotal.Inc()
 	s.halted = true
+	// No snapshot here — an empty gate makes the first halted tick publish the
+	// live shape, which is exactly the report a human wants after this alert.
+	s.haltedShape = ""
 	haltedGauge.Set(1)
 	s.log.Error("ALERT: halting trading", "id", in.ID, "reason", reason)
 	s.emitFailed(ctx, in, reason)

@@ -24,7 +24,11 @@ func main() {
 		}
 	}
 
-	nc, err := nats.Connect(nats.DefaultURL)
+	url := os.Getenv("NATS_URL")
+	if url == "" {
+		url = nats.DefaultURL
+	}
+	nc, err := nats.Connect(url)
 	if err != nil {
 		log.Fatalf("connect: %v", err)
 	}
