@@ -111,6 +111,7 @@ func buildSpotAssets(m spotMetaResp) map[string]assetRef {
 var spotBaseAliases = map[string]string{
 	"BTC": "UBTC",
 	"ETH": "UETH",
+	"SOL": "USOL",
 }
 
 func spotBaseAlias(coin string) string {

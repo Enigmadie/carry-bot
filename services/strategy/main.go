@@ -18,6 +18,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"math"
 	"os"
 	"os/signal"
 	"strconv"
@@ -53,13 +54,19 @@ var (
 		Namespace: metrics.Namespace, Subsystem: "strategy",
 		Name: "publish_errors_total", Help: "Intent publishes that failed their JetStream ack.",
 	})
+	gatedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metrics.Namespace, Subsystem: "strategy",
+		Name: "gated_total", Help: "Funding ticks that met the entry threshold but were blocked from opening, by reason (basis|cooldown|no-price).",
+	}, []string{"reason"})
 )
 
 type config struct {
 	NATSURL        string
 	Symbol         string
-	EntryThreshold float64 // open when funding >= this (fraction: 0.0001 = 0.01%)
-	ExitThreshold  float64 // close when funding <= this; keep ExitThreshold < EntryThreshold
+	EntryThreshold float64       // open when funding >= this (fraction: 0.0001 = 0.01%)
+	ExitThreshold  float64       // close when funding <= this; keep ExitThreshold < EntryThreshold
+	MaxBasis       float64       // open only when |perp−spot|/spot <= this; <=0 disables
+	ReopenCooldown time.Duration // quiet period after a forced close; 0 disables
 	MetricsAddr    string
 }
 
@@ -69,6 +76,8 @@ func loadConfig() config {
 		Symbol:         getenv("SYMBOL", "BTCUSDT"),
 		EntryThreshold: getfloat("ENTRY_THRESHOLD", 0.0001),
 		ExitThreshold:  getfloat("EXIT_THRESHOLD", 0.00005),
+		MaxBasis:       getfloat("MAX_BASIS", 0.01),
+		ReopenCooldown: getdur("REOPEN_COOLDOWN", 30*time.Minute),
 		MetricsAddr:    getenv("METRICS_ADDR", ":2113"),
 	}
 }
@@ -138,6 +147,16 @@ type service struct {
 	state     position
 	spotPrice float64
 	perpPrice float64
+
+	// cooldownUntil suppresses reopening after a forced close (the exchange
+	// closed a leg itself — ADL/liquidation; carried as a non-empty Reason on
+	// the closed fact). Armed from the fact's own timestamp, so a replayed
+	// day-old fact doesn't re-arm it on restart.
+	cooldownUntil time.Time
+
+	// lastGate is the reason entry was last blocked, so a standing block is
+	// logged once instead of on every funding tick.
+	lastGate string
 
 	// Seeding: on startup the EXEC replay walks the state machine to the current
 	// truth; until it has caught up, evaluate() must not emit — a funding tick
@@ -333,6 +352,19 @@ func (s *service) onExec(m jetstream.Msg) {
 		case events.SubjPositionOpened:
 			s.setState(open, "exec opened "+r.IntentID)
 		case events.SubjPositionClosed:
+			// A non-empty Reason marks a forced close (the exchange killed a leg;
+			// order auto-closed the orphan) rather than our own exit — arm the
+			// reopen cooldown from the fact's timestamp so a replayed old fact on
+			// restart doesn't re-arm an expired one.
+			if r.Reason != "" && s.cfg.ReopenCooldown > 0 {
+				if until := r.Time.Add(s.cfg.ReopenCooldown); until.After(s.cooldownUntil) {
+					s.cooldownUntil = until
+					if until.After(time.Now().UTC()) {
+						s.log.Warn("forced close — reopen cooldown armed",
+							"until", until, "close_reason", r.Reason)
+					}
+				}
+			}
 			s.setState(flat, "exec closed "+r.IntentID)
 		case events.SubjExecFailed:
 			if s.state == pendingOpen && r.Side == events.IntentOpen {
@@ -379,6 +411,17 @@ func (s *service) evaluate(ctx context.Context, fr events.FundingRate) {
 	switch s.state {
 	case flat:
 		if fr.Rate >= s.cfg.EntryThreshold {
+			if gate := s.openGate(); gate != "" {
+				gatedTotal.WithLabelValues(gate).Inc()
+				if s.lastGate != gate {
+					s.lastGate = gate
+					s.log.Warn("entry gated", "reason", gate,
+						"funding", fr.Rate, "spot", s.spotPrice, "perp", s.perpPrice,
+						"cooldown_until", s.cooldownUntil)
+				}
+				return
+			}
+			s.lastGate = ""
 			reason := fmt.Sprintf("funding %.4f%% >= %.4f%%",
 				fr.Rate*100, s.cfg.EntryThreshold*100)
 			s.emit(ctx, events.SubjIntentOpen, events.IntentOpen, reason, fr)
@@ -390,6 +433,31 @@ func (s *service) evaluate(ctx context.Context, fr events.FundingRate) {
 			s.emit(ctx, events.SubjIntentClose, events.IntentClose, reason, fr)
 		}
 	}
+}
+
+// openGate is the pre-trade sanity check on top of the funding trigger; it
+// returns the blocking reason, or "" when opening is allowed. The basis check
+// is the strategy's own invariant made explicit: the pair is only a hedge if
+// spot and perp trade near each other — funding earns fractions of a percent,
+// while a dislocated basis is exposure on the whole gap and (shorts deep in
+// profit) is exactly what puts the perp first in line for ADL. Unknown prices
+// block for the same reason: no basis, no judgement. The cooldown stops a
+// forced-close loop (open → ADL → auto-close → reopen) from grinding the
+// account through slippage.
+func (s *service) openGate() string {
+	if time.Now().UTC().Before(s.cooldownUntil) {
+		return "cooldown"
+	}
+	if s.cfg.MaxBasis <= 0 {
+		return ""
+	}
+	if s.spotPrice <= 0 || s.perpPrice <= 0 {
+		return "no-price"
+	}
+	if math.Abs(s.perpPrice-s.spotPrice)/s.spotPrice > s.cfg.MaxBasis {
+		return "basis"
+	}
+	return ""
 }
 
 // emit publishes an intent to JetStream and moves the state machine to the
@@ -466,6 +534,17 @@ func getfloat(key string, def float64) float64 {
 	if v := os.Getenv(key); v != "" {
 		if f, err := strconv.ParseFloat(v, 64); err == nil {
 			return f
+		}
+	}
+	return def
+}
+
+// getdur parses a Go duration (e.g. "30m"); a missing or malformed value falls
+// back to def, so a typo degrades to the default rather than crashing.
+func getdur(key string, def time.Duration) time.Duration {
+	if v := os.Getenv(key); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			return d
 		}
 	}
 	return def
