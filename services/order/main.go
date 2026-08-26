@@ -124,6 +124,9 @@ type config struct {
 	APISecret    string
 	MockFailLeg  string        // mock only: category whose leg fails, for rollback testing
 	MockADLAfter time.Duration // mock only: force-close the perp this long after open (ADL simulation)
+	PaperPrices  bool          // mock only: fill against live marks and real funding instead of constants
+	PaperFee     float64       // mock paper only: taker fee charged per fill
+	PaperSlip    float64       // mock paper only: adverse offset from the mark a fill prints at
 
 	HLAPI        string  // hyperliquid REST host; "" → testnet
 	HLWS         string  // hyperliquid WS host for user fills; "" → follows HLMainnet
@@ -154,6 +157,9 @@ func loadConfig() config {
 		APISecret:    os.Getenv("BYBIT_API_SECRET"),
 		MockFailLeg:  os.Getenv("MOCK_FAIL_LEG"),
 		MockADLAfter: getdur("MOCK_ADL_AFTER", 0),
+		PaperPrices:  getbool("PAPER_PRICES", false),
+		PaperFee:     getfloat("PAPER_FEE", 0.00045),
+		PaperSlip:    getfloat("PAPER_SLIPPAGE", 0.0005),
 
 		HLAPI:        os.Getenv("HL_API"),
 		HLWS:         os.Getenv("HL_WS"),
@@ -210,7 +216,20 @@ type service struct {
 func buildExchange(ctx context.Context, cfg config) (exchange.Exchange, error) {
 	switch cfg.Provider {
 	case "mock":
-		return mock.New(cfg.MockFailLeg, cfg.MockADLAfter), nil
+		m := mock.New(cfg.MockFailLeg, cfg.MockADLAfter)
+		if cfg.PaperPrices {
+			// Read-only client: no signing key, so it can price and read funding but
+			// physically cannot place an order — the guarantee a shadow run rests on.
+			mkt, err := hyperliquid.New(hyperliquid.Config{BaseURL: cfg.HLAPI, Mainnet: cfg.HLMainnet})
+			if err != nil {
+				return nil, fmt.Errorf("paper market client: %w", err)
+			}
+			if err := mkt.LoadMeta(ctx); err != nil {
+				return nil, fmt.Errorf("load paper market meta: %w", err)
+			}
+			m.UsePrices(mkt, cfg.PaperFee, cfg.PaperSlip)
+		}
+		return m, nil
 	case "bybit":
 		if cfg.APIKey == "" || cfg.APISecret == "" {
 			return nil, errors.New("EXCHANGE=bybit requires BYBIT_API_KEY and BYBIT_API_SECRET")
