@@ -6,7 +6,7 @@
 // The position state machine is driven by execution facts, not by our own
 // intents: publishing an intent moves the state to pending, and only the
 // exec.position.opened/closed fact from order-service confirms the flip (an
-// exec.failed reverts it). A durable consumer on the EXEC stream replays those
+// exec.failed reverts it). An ordered consumer on the EXEC stream replays those
 // facts across restarts, and order-service's startup exec.reconciled snapshot
 // anchors them to the exchange's live position — so strategy never believes in
 // a position the exchange doesn't hold, which is exactly how the first live
@@ -161,9 +161,8 @@ type service struct {
 	// Seeding: on startup the EXEC replay walks the state machine to the current
 	// truth; until it has caught up, evaluate() must not emit — a funding tick
 	// racing the replay would fire an intent from a stale (default flat) state.
-	seeded      bool
-	seedPending uint64 // facts the replay still owes us at startup
-	seedSeen    uint64
+	seeded   bool
+	seedSeen uint64
 }
 
 func main() {
@@ -222,52 +221,62 @@ func main() {
 func (s *service) run(ctx context.Context, nc *nats.Conn) error {
 	// EXEC is owned by order-service; ensure it here too (same config) so
 	// strategy can start independently of start order, like portfolio does.
-	if _, err := s.js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
+	stream, err := s.js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
 		Name:      execStream,
 		Subjects:  []string{"exec.>"},
 		Storage:   jetstream.FileStorage,
 		Retention: jetstream.LimitsPolicy,
 		MaxAge:    streamMaxAge,
-	}); err != nil {
+	})
+	if err != nil {
 		return fmt.Errorf("ensure exec stream: %w", err)
 	}
 
-	// Ephemeral, deliver-all: every start replays the stream's retained facts
-	// from the beginning, walking the state machine to the current truth. A
-	// durable would be wrong here — its cursor sits past the already-consumed
-	// history, so a restart would learn nothing and boot as flat. Transitions
-	// are idempotent, so re-applying old facts is free; AckNone because we keep
-	// no cursor to advance. If the whole window aged out (MaxAge) while a
-	// position is held, we still boot flat — order-service's stale-intent guard
-	// answers the resulting intent with a fresh reconcile snapshot (see its
-	// open/closePosition), so the machine self-corrects before any trade.
-	cons, err := s.js.CreateOrUpdateConsumer(ctx, execStream, jetstream.ConsumerConfig{
-		AckPolicy:     jetstream.AckNonePolicy,
-		DeliverPolicy: jetstream.DeliverAllPolicy,
-		FilterSubjects: []string{
-			events.SubjPositionOpened, events.SubjPositionClosed,
-			events.SubjExecFailed, events.SubjReconciled,
-		},
+	execSubjects := []string{
+		events.SubjPositionOpened, events.SubjPositionClosed,
+		events.SubjExecFailed, events.SubjReconciled,
+	}
+
+	// evaluate() stays quiet until the replay has caught up (see countSeed), so
+	// a live funding tick can't race it and fire an intent off a stale state.
+	// The count only tells us whether there is anything to wait for; catching
+	// up is detected per message, since the consumer itself isn't created yet.
+	info, err := stream.Info(ctx, jetstream.WithSubjectFilter("exec.>"))
+	if err != nil {
+		return fmt.Errorf("exec stream info: %w", err)
+	}
+	var facts uint64
+	for _, subj := range execSubjects {
+		facts += info.State.Subjects[subj]
+	}
+	s.seeded = facts == 0
+	s.log.Info("seeding state from exec history", "facts", facts)
+
+	// Ordered consumer, deliver-all: every start replays the stream's retained
+	// facts from the beginning, walking the state machine to the current truth.
+	// A durable would be wrong here — its cursor sits past the already-consumed
+	// history, so a restart would learn nothing and boot as flat. Unlike a plain
+	// ephemeral consumer it survives losing its server-side half (inactivity
+	// cleanup, NATS restart, missed heartbeats): the library recreates it from
+	// the last delivered sequence; a plain one silently pulls into the void and
+	// strategy never learns the outcome of its own intents. If the
+	// whole window aged out (MaxAge) while a position is held, we still boot
+	// flat — order-service's stale-intent guard answers the resulting intent
+	// with a fresh reconcile snapshot (see its open/closePosition), so the
+	// machine self-corrects before any trade.
+	cons, err := stream.OrderedConsumer(ctx, jetstream.OrderedConsumerConfig{
+		FilterSubjects: execSubjects,
+		DeliverPolicy:  jetstream.DeliverAllPolicy,
 	})
 	if err != nil {
-		return fmt.Errorf("ensure exec consumer: %w", err)
+		return fmt.Errorf("create exec consumer: %w", err)
 	}
-
-	// How much history the replay owes us; evaluate() stays quiet until the
-	// backlog has been applied (see onExec), so a live funding tick can't race
-	// the replay and fire an intent off a stale state.
-	info, err := cons.Info(ctx)
-	if err != nil {
-		return fmt.Errorf("exec consumer info: %w", err)
-	}
-	s.seedPending = info.NumPending
-	if s.seedPending == 0 {
-		s.seeded = true
-	}
-	s.log.Info("seeding state from exec history", "facts", s.seedPending)
 
 	execs := make(chan jetstream.Msg, 16)
-	cc, err := cons.Consume(func(m jetstream.Msg) { execs <- m })
+	cc, err := cons.Consume(func(m jetstream.Msg) { execs <- m },
+		jetstream.ConsumeErrHandler(func(_ jetstream.ConsumeContext, err error) {
+			s.log.Warn("exec consumer error", "err", err)
+		}))
 	if err != nil {
 		return fmt.Errorf("start exec consume: %w", err)
 	}
@@ -281,7 +290,7 @@ func (s *service) run(ctx context.Context, nc *nats.Conn) error {
 	}{
 		{events.SubjPricePerp, parsePrice("perp")},
 		{events.SubjPriceSpot, parsePrice("spot")},
-		{events.SubjFundingPredicted, parseFunding},
+		{events.SubjFundingSettled, parseFunding},
 	}
 	for _, sub := range subs {
 		parse := sub.parse
@@ -324,7 +333,7 @@ func (s *service) run(ctx context.Context, nc *nats.Conn) error {
 // snapshot overrides everything — it is the exchange's own word. No ack
 // bookkeeping: the consumer is AckNone, a decode error just skips the fact.
 func (s *service) onExec(m jetstream.Msg) {
-	defer s.countSeed()
+	defer s.countSeed(m)
 	switch m.Subject() {
 	case events.SubjReconciled:
 		var r events.Reconciled
@@ -376,14 +385,19 @@ func (s *service) onExec(m jetstream.Msg) {
 	}
 }
 
-// countSeed marks the startup backlog as applied fact by fact; once the replay
-// has caught up, evaluate() is unmuted.
-func (s *service) countSeed() {
+// countSeed unmutes evaluate() once the replay has caught up: NumPending in the
+// delivery metadata is how many matching facts are still queued behind this one.
+func (s *service) countSeed(m jetstream.Msg) {
 	if s.seeded {
 		return
 	}
 	s.seedSeen++
-	if s.seedSeen >= s.seedPending {
+	meta, err := m.Metadata()
+	if err != nil {
+		s.log.Error("exec fact metadata", "err", err)
+		return
+	}
+	if meta.NumPending == 0 {
 		s.seeded = true
 		s.log.Info("state seeded from exec history", "facts", s.seedSeen, "state", s.state)
 	}

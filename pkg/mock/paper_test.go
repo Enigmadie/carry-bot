@@ -10,9 +10,10 @@ import (
 )
 
 type fakeMarket struct {
-	mark  float64
-	rate  float64
-	calls int
+	mark    float64
+	rate    float64
+	pending bool // settlement not published yet
+	calls   int
 }
 
 func (f *fakeMarket) Mark(context.Context, string, string) (float64, error) {
@@ -20,8 +21,8 @@ func (f *fakeMarket) Mark(context.Context, string, string) (float64, error) {
 	return f.mark, nil
 }
 
-func (f *fakeMarket) FundingRate(context.Context, string) (float64, error) {
-	return f.rate, nil
+func (f *fakeMarket) SettledFunding(context.Context, string, time.Time) (float64, bool, error) {
+	return f.rate, !f.pending, nil
 }
 
 // A paper fill must print at the live mark moved against us — a buy pays up, a
@@ -135,5 +136,29 @@ func TestPaperFundingNegativeRateDebitsShort(t *testing.T) {
 	}
 	if len(got) != 1 || got[0].Amount >= 0 {
 		t.Fatalf("got %+v, want a single negative accrual", got)
+	}
+}
+
+// Right after the boundary the settlement may not be published yet; that hour
+// must stay unbooked rather than be marked paid, or the poll would skip it.
+func TestPaperFundingWaitsForSettlement(t *testing.T) {
+	mkt := &fakeMarket{mark: 50, rate: 0.0001, pending: true}
+	m := New("", 0)
+	m.UsePrices(mkt, 0, 0)
+
+	if _, err := m.PlaceOrder(context.Background(), exchange.OrderRequest{
+		Category: exchange.CategoryLinear, Symbol: "HYPEUSDC",
+		Side: exchange.SideSell, Qty: "1", OrderLinkID: "short-1",
+	}); err != nil {
+		t.Fatalf("short: %v", err)
+	}
+	if got, err := m.Funding(context.Background(), "HYPEUSDC", time.Time{}); err != nil || len(got) != 0 {
+		t.Fatalf("unpublished settlement booked: %v, %v", got, err)
+	}
+
+	mkt.pending = false
+	got, err := m.Funding(context.Background(), "HYPEUSDC", time.Time{})
+	if err != nil || len(got) != 1 {
+		t.Fatalf("published settlement = %v, %v; want one payment", got, err)
 	}
 }

@@ -7,6 +7,11 @@
 // and "@<index>" for spot) and activeAssetCtx (per-coin context carrying the
 // funding rate). Hyperliquid keys spot mids by a numeric index, so the instrument
 // keys are resolved once at startup from /info metadata (see pkg/hyperliquid).
+//
+// Alongside the live prediction it republishes the last actual hourly settlement,
+// polled from /info fundingHistory. Strategy trades on that one: the prediction
+// is averaged over seconds of premium early in each hour and spikes far past
+// anything that settles.
 package main
 
 import (
@@ -52,7 +57,7 @@ var staleTimeout = 45 * time.Second
 var (
 	ticksTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: metrics.Namespace, Subsystem: "market",
-		Name: "ticks_total", Help: "Market ticks republished onto NATS, by kind (perp|spot|funding).",
+		Name: "ticks_total", Help: "Market ticks republished onto NATS, by kind (perp|spot|funding|settled).",
 	}, []string{"kind"})
 	lastPrice = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Namespace: metrics.Namespace, Subsystem: "market",
@@ -61,6 +66,10 @@ var (
 	fundingRate = promauto.NewGauge(prometheus.GaugeOpts{
 		Namespace: metrics.Namespace, Subsystem: "market",
 		Name: "funding_rate", Help: "Most recent predicted funding rate (fraction).",
+	})
+	fundingSettled = promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: metrics.Namespace, Subsystem: "market",
+		Name: "funding_settled_rate", Help: "Most recent settled funding rate (fraction).",
 	})
 	wsReconnects = promauto.NewCounter(prometheus.CounterOpts{
 		Namespace: metrics.Namespace, Subsystem: "market",
@@ -75,6 +84,7 @@ type config struct {
 	RESTURL     string // /info host for metadata; "" → testnet
 	Symbol      string
 	MetricsAddr string
+	SettledPoll time.Duration // how often to re-read the last funding settlement
 }
 
 func loadConfig() config {
@@ -86,6 +96,7 @@ func loadConfig() config {
 		RESTURL:     os.Getenv("HL_API"),
 		Symbol:      getenv("SYMBOL", "BTCUSDT"),
 		MetricsAddr: getenv("METRICS_ADDR", ":2112"),
+		SettledPoll: getdur("SETTLED_POLL", time.Minute),
 	}
 }
 
@@ -108,6 +119,7 @@ type service struct {
 	// spot pair, in which case we run perp + funding only.
 	coin    string
 	spotKey string
+	hl      *hyperliquid.Client
 }
 
 func main() {
@@ -146,7 +158,8 @@ func main() {
 		log.Warn("no spot listing for symbol; running perp + funding only", "symbol", cfg.Symbol)
 	}
 
-	s := &service{log: log, nc: nc, cfg: cfg, ws: &http.Client{}, coin: coin, spotKey: spotKey}
+	s := &service{log: log, nc: nc, cfg: cfg, ws: &http.Client{}, coin: coin, spotKey: spotKey, hl: hl}
+	go s.settledLoop(ctx)
 
 	// One WebSocket carries both feeds (Hyperliquid multiplexes channels), so a
 	// single reconnect loop owns the connection and unwinds with the root context.
@@ -349,6 +362,40 @@ func (s *service) handleAssetCtx(raw json.RawMessage) error {
 	return nil
 }
 
+// settledLoop republishes the last funding settlement every SettledPoll. The
+// same settlement goes out ~60 times an hour on purpose: core NATS keeps nothing,
+// so a restarted strategy hears it within one poll, and a close that failed is
+// re-triggered instead of waiting for the next hour.
+func (s *service) settledLoop(ctx context.Context) {
+	t := time.NewTicker(s.cfg.SettledPoll)
+	defer t.Stop()
+	var last time.Time
+	for {
+		tick, ok, err := s.hl.LastSettledFunding(ctx, s.cfg.Symbol, time.Now().UTC())
+		switch {
+		case err != nil:
+			if ctx.Err() == nil {
+				s.log.Warn("settled funding", "err", err)
+			}
+		case ok:
+			if !tick.Time.Equal(last) {
+				last = tick.Time
+				s.log.Info("funding settled", "rate", tick.Rate, "at", tick.Time)
+			}
+			s.publish(events.SubjFundingSettled, events.FundingRate{
+				Symbol: s.cfg.Symbol, Rate: tick.Rate, Time: tick.Time,
+			})
+			ticksTotal.WithLabelValues("settled").Inc()
+			fundingSettled.Set(tick.Rate)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+	}
+}
+
 func (s *service) publish(subject string, v any) {
 	data, err := json.Marshal(v)
 	if err != nil {
@@ -379,4 +426,15 @@ func getbool(key string, def bool) bool {
 	default:
 		return def
 	}
+}
+
+// getdur parses a Go duration (e.g. "1m"); a missing or malformed value falls
+// back to def, so a typo degrades to the default rather than crashing.
+func getdur(key string, def time.Duration) time.Duration {
+	if v := os.Getenv(key); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			return d
+		}
+	}
+	return def
 }

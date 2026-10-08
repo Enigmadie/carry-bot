@@ -48,7 +48,7 @@ var (
 // half of an exchange client, so an unauthenticated one satisfies it.
 type Market interface {
 	Mark(ctx context.Context, category, symbol string) (float64, error)
-	FundingRate(ctx context.Context, symbol string) (float64, error)
+	SettledFunding(ctx context.Context, symbol string, hour time.Time) (rate float64, ok bool, err error)
 }
 
 type Exchange struct {
@@ -233,8 +233,9 @@ func (m *Exchange) Classify(err error) exchange.ErrorKind {
 // perp short is actually open. Hyperliquid settles hourly on the hour, so the
 // payment is dated to the last boundary and the boundary itself is the dedup key —
 // without that the 30s funding poll would book the same hour 120 times over. The
-// amount is the published rate against the position's notional at the current mark,
-// which is what the real settlement charges.
+// amount is the rate that actually settled at that boundary against the position's
+// notional at the current mark; an hour whose settlement isn't published yet is
+// left unbooked and retried on the next poll.
 func (m *Exchange) paperFunding(ctx context.Context, symbol string, since time.Time) ([]exchange.FundingPayment, error) {
 	m.mu.Lock()
 	mkt, perp, paid := m.market, m.perpSize, m.lastPaid
@@ -248,9 +249,12 @@ func (m *Exchange) paperFunding(ctx context.Context, symbol string, since time.T
 		return nil, nil
 	}
 
-	rate, err := mkt.FundingRate(ctx, symbol)
+	rate, ok, err := mkt.SettledFunding(ctx, symbol, settled)
 	if err != nil {
-		return nil, fmt.Errorf("mock: funding rate for %s: %w", symbol, err)
+		return nil, fmt.Errorf("mock: settled funding for %s: %w", symbol, err)
+	}
+	if !ok {
+		return nil, nil
 	}
 	mark, err := mkt.Mark(ctx, exchange.CategoryLinear, symbol)
 	if err != nil {

@@ -82,3 +82,17 @@ func (c *Client) FundingHistory(ctx context.Context, symbol string, start, end t
 	}
 	return out, nil
 }
+
+// settledLookback is how far back LastSettledFunding searches; a few hours
+// covers an API hiccup without paging through history.
+const settledLookback = 3 * time.Hour
+
+// LastSettledFunding returns the most recent settlement up to now; ok is false
+// when none landed within settledLookback.
+func (c *Client) LastSettledFunding(ctx context.Context, symbol string, now time.Time) (tick FundingTick, ok bool, err error) {
+	ticks, err := c.FundingHistory(ctx, symbol, now.Add(-settledLookback), now)
+	if err != nil || len(ticks) == 0 {
+		return FundingTick{}, false, err
+	}
+	return ticks[len(ticks)-1], true, nil
+}

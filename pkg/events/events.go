@@ -11,6 +11,7 @@ const (
 	SubjPriceSpot        = "market.price.spot.BTCUSDT"
 	SubjPricePerp        = "market.price.perp.BTCUSDT"
 	SubjFundingPredicted = "market.funding.predicted.BTCUSDT"
+	SubjFundingSettled   = "market.funding.settled.BTCUSDT"
 
 	// Strategy intents — JetStream (durable, must not be lost).
 	SubjIntentOpen  = "strategy.intent.open"
@@ -34,8 +35,10 @@ type Price struct {
 	Time   time.Time `json:"time"`
 }
 
-// FundingRate is the current predicted funding rate for a perpetual.
-// Rate is a fraction: 0.0001 means 0.01% per funding interval.
+// FundingRate is a perpetual's funding rate: the live prediction on
+// SubjFundingPredicted, or the last actual settlement on SubjFundingSettled
+// (Time is then the settlement time). Rate is a fraction: 0.0001 means 0.01%
+// per funding interval.
 type FundingRate struct {
 	Symbol       string    `json:"symbol"`
 	Rate         float64   `json:"rate"`
