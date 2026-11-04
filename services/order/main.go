@@ -756,11 +756,18 @@ func (s *service) openPosition(ctx context.Context, in events.Intent) error {
 		// don't hold a naked long. Terminal regardless of the error kind — a retry
 		// would re-open the spot leg.
 		s.log.Error("perp leg failed, rolling back spot", "id", in.ID, "err", err)
+		rbQty, qErr := s.spotSellQty(ctx, in.Symbol)
+		if qErr != nil {
+			// Selling blind at ORDER_QTY may bounce on balance, but it is still
+			// the best shot at not leaving a naked long; a bounce lands in alert.
+			s.log.Warn("rollback: read spot balance, selling ORDER_QTY", "err", qErr)
+			rbQty = s.cfg.OrderQty
+		}
 		if _, rbErr := s.placeLeg(ctx, in, exchange.OrderRequest{
 			Category:    exchange.CategorySpot,
 			Symbol:      in.Symbol,
 			Side:        exchange.SideSell,
-			Qty:         s.cfg.OrderQty,
+			Qty:         rbQty,
 			OrderLinkID: legID(in.ID, "rb"),
 		}); rbErr != nil {
 			s.alert(ctx, in, "ROLLBACK FAILED — naked spot long, manual intervention required: "+rbErr.Error())
@@ -790,6 +797,12 @@ func (s *service) closePosition(ctx context.Context, in events.Intent) error {
 		}
 		return nil
 	}
+	// Sized before touching the perp: a failed read changes nothing yet, so it
+	// can simply be redelivered.
+	spotQty, err := s.spotSellQty(ctx, in.Symbol)
+	if err != nil {
+		return fmt.Errorf("read spot balance: %w: %w", err, errRetry)
+	}
 	perp, err := s.placeLeg(ctx, in, exchange.OrderRequest{
 		Category:    exchange.CategoryLinear,
 		Symbol:      in.Symbol,
@@ -811,7 +824,7 @@ func (s *service) closePosition(ctx context.Context, in events.Intent) error {
 		Category:    exchange.CategorySpot,
 		Symbol:      in.Symbol,
 		Side:        exchange.SideSell,
-		Qty:         s.cfg.OrderQty,
+		Qty:         spotQty,
 		OrderLinkID: legID(in.ID, "s"),
 	})
 	if err != nil {
@@ -821,6 +834,29 @@ func (s *service) closePosition(ctx context.Context, in events.Intent) error {
 
 	s.emitClosed(ctx, in, spot, perp)
 	return nil
+}
+
+// spotSellQty sizes the spot sell that unwinds our long from the live balance.
+func (s *service) spotSellQty(ctx context.Context, symbol string) (string, error) {
+	st, err := s.ex.State(ctx, symbol)
+	if err != nil {
+		return "", err
+	}
+	return strconv.FormatFloat(spotSellSize(st.SpotSize, s.qty()), 'f', -1, 64), nil
+}
+
+// spotSellSize is the held spot balance capped at the ordered qty. Hyperliquid
+// takes the buy fee in the received token, so a leg bought at ORDER_QTY holds
+// slightly less and selling the full qty is rejected for balance; the cap
+// leaves any balance that isn't ours alone. A balance at dust means the leg was
+// already sold (a redelivered close or rollback), so the ordered qty goes out
+// unchanged and the replay hits the exchange's cloid dedup instead of a
+// zero-size order.
+func spotSellSize(held, ordered float64) float64 {
+	if held <= ordered*legDustFraction {
+		return ordered
+	}
+	return math.Min(held, ordered)
 }
 
 // placeLeg submits one order. A duplicate orderLinkId means a previous delivery
