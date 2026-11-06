@@ -206,8 +206,7 @@ func parseOrderResp(linkID string, resp exchangeResp) (*exchange.OrderResult, er
 	case st.Filled != nil:
 		px, _ := strconv.ParseFloat(st.Filled.AvgPx, 64)
 		sz, _ := strconv.ParseFloat(st.Filled.TotalSz, 64)
-		// Fee is not on the order ack — it needs a userFills follow-up — so it's
-		// left at 0, the same deferral as bybit's fill data.
+		// Fee is not on the order ack; callers read it back via OrderFees (fees.go).
 		return &exchange.OrderResult{
 			OrderID:     strconv.FormatUint(st.Filled.Oid, 10),
 			OrderLinkID: linkID,

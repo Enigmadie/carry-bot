@@ -55,7 +55,7 @@ func (f *hlLike) PlaceOrder(_ context.Context, req exchange.OrderRequest) (*exch
 		f.perp += qty
 	}
 	f.seen[req.OrderLinkID] = true
-	return &exchange.OrderResult{OrderLinkID: req.OrderLinkID, FilledQty: qty}, nil
+	return &exchange.OrderResult{OrderID: "oid-" + req.OrderLinkID, OrderLinkID: req.OrderLinkID, FilledQty: qty}, nil
 }
 
 func (f *hlLike) Classify(err error) exchange.ErrorKind {
@@ -82,10 +82,12 @@ func (f *hlLike) State(context.Context, string) (*exchange.PositionState, error)
 type recordJS struct {
 	jetstream.JetStream
 	subjects []string
+	payloads [][]byte
 }
 
-func (r *recordJS) Publish(_ context.Context, subj string, _ []byte, _ ...jetstream.PublishOpt) (*jetstream.PubAck, error) {
+func (r *recordJS) Publish(_ context.Context, subj string, data []byte, _ ...jetstream.PublishOpt) (*jetstream.PubAck, error) {
 	r.subjects = append(r.subjects, subj)
+	r.payloads = append(r.payloads, data)
 	return &jetstream.PubAck{}, nil
 }
 

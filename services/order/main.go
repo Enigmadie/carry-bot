@@ -950,7 +950,61 @@ func (s *service) emitFunding(ctx context.Context, p exchange.FundingPayment) {
 	s.log.Info("funding received", "id", p.ID, "symbol", p.Symbol, "amount", p.Amount)
 }
 
+// Fee lookup runs after both legs are done, so a slow or missing answer costs
+// only fee accuracy in the ledger, never leg timing.
+const feeLookupAttempts = 3
+
+var feeLookupBackoff = 300 * time.Millisecond // var so tests can shorten it
+
+// fillFees sets Fee on legs whose provider reports it only after the fact. A
+// leg that still has no fee after the retries is booked at 0 with a warning.
+// A replayed leg has no OrderID and is skipped, since its fee was booked by
+// the delivery that placed it.
+func (s *service) fillFees(ctx context.Context, legs ...*exchange.OrderResult) {
+	fr, ok := s.ex.(exchange.FeeReporter)
+	if !ok {
+		return
+	}
+	var ids []string
+	for _, l := range legs {
+		if l.OrderID != "" && l.Fee == 0 {
+			ids = append(ids, l.OrderID)
+		}
+	}
+	if len(ids) == 0 {
+		return
+	}
+
+	var fees map[string]float64
+	var err error
+	for i := 0; i < feeLookupAttempts; i++ {
+		if i > 0 {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(feeLookupBackoff):
+			}
+		}
+		fees, err = fr.OrderFees(ctx, ids)
+		if err == nil && len(fees) == len(ids) {
+			break
+		}
+	}
+	if err != nil {
+		s.log.Warn("fee lookup failed, booking 0", "orders", ids, "err", err)
+		return
+	}
+	for _, l := range legs {
+		if fee, ok := fees[l.OrderID]; ok {
+			l.Fee = fee
+		} else if l.OrderID != "" && l.Fee == 0 {
+			s.log.Warn("fee not found in fills, booking 0", "order_id", l.OrderID)
+		}
+	}
+}
+
 func (s *service) emitOpened(ctx context.Context, in events.Intent, spot, perp *exchange.OrderResult) {
+	s.fillFees(ctx, spot, perp)
 	s.emit(ctx, events.SubjPositionOpened, events.ExecReport{
 		IntentID: in.ID, Symbol: in.Symbol, Side: in.Side, Qty: s.qty(),
 		SpotOrderID: spot.OrderID, PerpOrderID: perp.OrderID,
@@ -963,6 +1017,7 @@ func (s *service) emitOpened(ctx context.Context, in events.Intent, spot, perp *
 }
 
 func (s *service) emitClosed(ctx context.Context, in events.Intent, spot, perp *exchange.OrderResult) {
+	s.fillFees(ctx, spot, perp)
 	s.emit(ctx, events.SubjPositionClosed, events.ExecReport{
 		IntentID: in.ID, Symbol: in.Symbol, Side: in.Side, Qty: s.qty(),
 		SpotOrderID: spot.OrderID, PerpOrderID: perp.OrderID,

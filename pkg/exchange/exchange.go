@@ -82,3 +82,13 @@ type Exchange interface {
 	// local state against the exchange at startup.
 	State(ctx context.Context, symbol string) (*PositionState, error)
 }
+
+// FeeReporter is an optional provider capability for exchanges whose order ack
+// carries no fee (Hyperliquid): the fee is read back from the account's fills.
+// Callers detect it with a type assertion, so providers that fill
+// OrderResult.Fee inline don't implement it.
+type FeeReporter interface {
+	// OrderFees returns the total fee per order id, in quote currency. An id
+	// whose fills the exchange hasn't indexed yet is absent from the map.
+	OrderFees(ctx context.Context, orderIDs []string) (map[string]float64, error)
+}
