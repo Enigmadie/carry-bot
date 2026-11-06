@@ -877,8 +877,10 @@ func (s *service) placeLeg(ctx context.Context, in events.Intent, req exchange.O
 		return nil, err
 	}
 	legsTotal.WithLabelValues(req.Category, req.Side, "placed").Inc()
+	// filled is what executed after the exchange's lot rounding; qty is what
+	// was asked (e.g. 0.29979 asked, 0.29 filled on 2-decimal HYPE spot).
 	s.log.Info("leg placed", "id", in.ID, "category", req.Category,
-		"side", req.Side, "qty", req.Qty, "order_id", res.OrderID)
+		"side", req.Side, "qty", req.Qty, "filled", res.FilledQty, "order_id", res.OrderID)
 	return res, nil
 }
 
