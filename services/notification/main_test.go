@@ -41,6 +41,7 @@ func TestFormat(t *testing.T) {
 		{events.SubjPositionOpened, report, "opened", "OPENED HYPEUSDC"},
 		{events.SubjPositionClosed, report, "closed", "CLOSED HYPEUSDC"},
 		{events.SubjPositionClosed, orphanClosed, "closed", "orphaned spot auto-closed"},
+		{events.SubjPositionResized, report, "resized", "RESIZED HYPEUSDC by +1"},
 		{events.SubjExecFailed, report, "failed", "spot leg failed: boom"},
 		{events.SubjReconciled, unbalanced, "reconciled", "UNBALANCED HYPEUSDC"},
 		{events.SubjReconciled, clean, "reconciled", ""},

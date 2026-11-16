@@ -162,3 +162,52 @@ func TestPaperFundingWaitsForSettlement(t *testing.T) {
 		t.Fatalf("published settlement = %v, %v; want one payment", got, err)
 	}
 }
+
+// Collateral must behave like the unified account order-service reads from
+// Hyperliquid: the spot buy is paid out of it, and a price rise drains it by
+// the short's loss — the number rebalancing is sized from.
+func TestPaperCollateralTracksShortPnL(t *testing.T) {
+	mkt := &fakeMarket{mark: 100}
+	m := New("", 0)
+	m.SetCollateral(500)
+	m.UsePrices(mkt, 0, 0)
+	ctx := context.Background()
+
+	for _, req := range []exchange.OrderRequest{
+		{Category: exchange.CategorySpot, Symbol: "HYPEUSDC", Side: exchange.SideBuy, Qty: "2", OrderLinkID: "s"},
+		{Category: exchange.CategoryLinear, Symbol: "HYPEUSDC", Side: exchange.SideSell, Qty: "2", OrderLinkID: "p"},
+	} {
+		if _, err := m.PlaceOrder(ctx, req); err != nil {
+			t.Fatalf("place %s: %v", req.Category, err)
+		}
+	}
+	collateral := func() float64 {
+		t.Helper()
+		st, err := m.State(ctx, "HYPEUSDC")
+		if err != nil {
+			t.Fatalf("state: %v", err)
+		}
+		return st.Collateral
+	}
+	if got := collateral(); got != 300 {
+		t.Fatalf("after open: collateral = %v, want 300 (500 − 2×100 of spot)", got)
+	}
+
+	mkt.mark = 130
+	if got := collateral(); got != 240 {
+		t.Fatalf("mark +30: collateral = %v, want 240 (short lost 2×30)", got)
+	}
+
+	// Shrinking by 1 at 130 realizes −30 on the perp and returns 130 from spot.
+	for _, req := range []exchange.OrderRequest{
+		{Category: exchange.CategoryLinear, Symbol: "HYPEUSDC", Side: exchange.SideBuy, Qty: "1", OrderLinkID: "p2", ReduceOnly: true},
+		{Category: exchange.CategorySpot, Symbol: "HYPEUSDC", Side: exchange.SideSell, Qty: "1", OrderLinkID: "s2"},
+	} {
+		if _, err := m.PlaceOrder(ctx, req); err != nil {
+			t.Fatalf("place %s: %v", req.Category, err)
+		}
+	}
+	if got := collateral(); got != 370 {
+		t.Fatalf("after shrink: collateral = %v, want 370", got)
+	}
+}

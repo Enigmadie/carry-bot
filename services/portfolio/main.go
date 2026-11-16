@@ -89,6 +89,22 @@ CREATE TABLE IF NOT EXISTS funding_payments (
     symbol      TEXT NOT NULL,
     amount      DOUBLE PRECISION NOT NULL,
     received_at TIMESTAMPTZ NOT NULL
+);
+
+-- P&L already banked by shrinking an open position; folded into realized_pnl
+-- when the position closes.
+ALTER TABLE positions ADD COLUMN IF NOT EXISTS realized_partial DOUBLE PRECISION NOT NULL DEFAULT 0;
+
+-- Resize ledger: one row per executed resize, keyed by the intent id. Like
+-- funding_payments, the PK is what makes a redelivered fact a no-op.
+CREATE TABLE IF NOT EXISTS position_resizes (
+    intent_id   TEXT PRIMARY KEY,
+    position_id BIGINT NOT NULL REFERENCES positions(id),
+    delta       DOUBLE PRECISION NOT NULL,
+    spot_price  DOUBLE PRECISION NOT NULL,
+    perp_price  DOUBLE PRECISION NOT NULL,
+    fee         DOUBLE PRECISION NOT NULL,
+    resized_at  TIMESTAMPTZ NOT NULL
 );`
 
 type config struct {
@@ -169,7 +185,7 @@ func (s *service) run(ctx context.Context) error {
 	cons, err := s.js.CreateOrUpdateConsumer(ctx, execStream, jetstream.ConsumerConfig{
 		Durable:        durableName,
 		AckPolicy:      jetstream.AckExplicitPolicy,
-		FilterSubjects: []string{events.SubjPositionOpened, events.SubjPositionClosed, events.SubjExecFailed, events.SubjFundingReceived, events.SubjReconciled},
+		FilterSubjects: []string{events.SubjPositionOpened, events.SubjPositionClosed, events.SubjPositionResized, events.SubjExecFailed, events.SubjFundingReceived, events.SubjReconciled},
 		AckWait:        ackWait,
 		MaxDeliver:     maxDeliver,
 	})
@@ -267,6 +283,8 @@ func (s *service) handle(ctx context.Context, m jetstream.Msg) {
 		err = s.onOpened(ctx, r)
 	case events.SubjPositionClosed:
 		err = s.onClosed(ctx, r)
+	case events.SubjPositionResized:
+		err = s.onResized(ctx, r)
 	case events.SubjExecFailed:
 		s.log.Warn("exec failed", "intent", r.IntentID, "error", r.Error)
 	default:
@@ -308,7 +326,8 @@ func (s *service) onOpened(ctx context.Context, r events.ExecReport) error {
 
 // Realized P&L of the delta-neutral pair: the spot long gains when spot rises,
 // the perp short gains when perp falls, minus all fees, plus funding booked over
-// the life of the position. fees in the expression is the pre-update (entry) fee.
+// the life of the position, plus whatever earlier shrinks already banked. fees in
+// the expression is the pre-update fee (entry and resizes).
 const settleClose = `
 UPDATE positions
 SET status          = 'closed',
@@ -321,6 +340,7 @@ SET status          = 'closed',
                     + (entry_perp_price - $3) * qty
                     - (fees + $4)
                     + funding_total
+                    + realized_partial
 WHERE id = (SELECT id FROM positions WHERE status = 'open' ORDER BY opened_at DESC LIMIT 1)
 RETURNING realized_pnl;`
 
@@ -339,6 +359,73 @@ func (s *service) onClosed(ctx context.Context, r events.ExecReport) error {
 	}
 	s.log.Info("position closed", "intent", r.IntentID, "realized_pnl", pnl)
 	return nil
+}
+
+// A grow blends the new fill into the entry prices (size-weighted average), so
+// the close formula keeps working on one qty and one entry per leg.
+const applyGrow = `
+UPDATE positions
+SET entry_spot_price = CASE WHEN $3::float8 > 0 THEN (entry_spot_price * qty + $3 * $2::float8) / (qty + $2) ELSE entry_spot_price END,
+    entry_perp_price = CASE WHEN $4::float8 > 0 THEN (entry_perp_price * qty + $4 * $2) / (qty + $2) ELSE entry_perp_price END,
+    qty              = qty + $2,
+    fees             = fees + $5
+WHERE id = $1;`
+
+// A shrink closes $2 coins of each leg at the fill prices: that slice's P&L is
+// banked in realized_partial and the entries of what remains are untouched.
+const applyShrink = `
+UPDATE positions
+SET realized_partial = realized_partial
+                     + CASE WHEN $3::float8 > 0 THEN ($3 - entry_spot_price) * $2::float8 ELSE 0 END
+                     + CASE WHEN $4::float8 > 0 THEN (entry_perp_price - $4) * $2 ELSE 0 END,
+    qty              = qty - $2,
+    fees             = fees + $5
+WHERE id = $1;`
+
+// onResized applies a resize to the open position, in one transaction with its
+// position_resizes row so a redelivered fact (PK conflict) changes nothing. A
+// leg price of 0 means the fill price is unknown (a replayed leg): that leg is
+// then left out of the average or the banked P&L instead of poisoning it.
+func (s *service) onResized(ctx context.Context, r events.ExecReport) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	var posID int64
+	err = tx.QueryRow(ctx,
+		`SELECT id FROM positions WHERE status = 'open' ORDER BY opened_at DESC LIMIT 1 FOR UPDATE`).Scan(&posID)
+	if err == pgx.ErrNoRows {
+		s.log.Warn("resize with no open position", "intent", r.IntentID)
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+
+	tag, err := tx.Exec(ctx,
+		`INSERT INTO position_resizes (intent_id, position_id, delta, spot_price, perp_price, fee, resized_at)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT (intent_id) DO NOTHING`,
+		r.IntentID, posID, r.Qty, r.SpotPrice, r.PerpPrice, r.Fee, r.Time)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		s.log.Info("resize already recorded (idempotent replay)", "intent", r.IntentID)
+		return tx.Commit(ctx)
+	}
+
+	query, size := applyGrow, r.Qty
+	if r.Qty < 0 {
+		query, size = applyShrink, -r.Qty
+	}
+	if _, err := tx.Exec(ctx, query, posID, size, r.SpotPrice, r.PerpPrice, r.Fee); err != nil {
+		return err
+	}
+	s.log.Info("position resized", "intent", r.IntentID, "position", posID,
+		"delta", r.Qty, "spot", r.SpotPrice, "perp", r.PerpPrice, "fee", r.Fee)
+	return tx.Commit(ctx)
 }
 
 func (s *service) handleFunding(ctx context.Context, m jetstream.Msg) {

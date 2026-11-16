@@ -23,6 +23,10 @@ func TestClassifyState(t *testing.T) {
 		{"partial leg", exchange.PositionState{PerpSize: -1.0, SpotSize: 0.5}, events.ReconcileUnbalanced},
 		{"perp long is never ours", exchange.PositionState{PerpSize: 1.0, SpotSize: 1.0}, events.ReconcileUnbalanced},
 		{"resting order on a flat book", exchange.PositionState{OpenOrders: 1}, events.ReconcileUnbalanced},
+		{"grown past ORDER_QTY, legs matched", exchange.PositionState{PerpSize: -2.1, SpotSize: 2.098}, events.ReconcileOpen},
+		{"shrunk below ORDER_QTY, legs matched", exchange.PositionState{PerpSize: -0.6, SpotSize: 0.61}, events.ReconcileOpen},
+		{"grown, perp partly force-closed", exchange.PositionState{PerpSize: -0.6, SpotSize: 2.1}, events.ReconcileUnbalanced},
+		{"grown, spot short of the perp", exchange.PositionState{PerpSize: -2.1, SpotSize: 1.5}, events.ReconcileUnbalanced},
 	}
 	for _, tc := range cases {
 		if got := classifyState(&tc.st, qty); got != tc.want {

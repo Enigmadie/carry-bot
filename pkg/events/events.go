@@ -14,15 +14,22 @@ const (
 	SubjFundingSettled   = "market.funding.settled.BTCUSDT"
 
 	// Strategy intents — JetStream (durable, must not be lost).
-	SubjIntentOpen  = "strategy.intent.open"
-	SubjIntentClose = "strategy.intent.close"
+	SubjIntentOpen   = "strategy.intent.open"
+	SubjIntentClose  = "strategy.intent.close"
+	SubjIntentResize = "strategy.intent.resize"
 
 	// Execution facts — JetStream.
 	SubjPositionOpened  = "exec.position.opened"
 	SubjPositionClosed  = "exec.position.closed"
+	SubjPositionResized = "exec.position.resized"
 	SubjExecFailed      = "exec.failed"
 	SubjFundingReceived = "exec.funding.received"
 	SubjReconciled      = "exec.reconciled"
+
+	// Account snapshot of the held pair — core NATS, like a price tick: the
+	// next one supersedes it. Deliberately outside exec.>, so the EXEC stream
+	// does not store one per reconcile poll.
+	SubjAccountState = "account.state"
 
 	// Portfolio state — JetStream (last value retained).
 	SubjPositionState = "portfolio.position.state"
@@ -48,18 +55,20 @@ type FundingRate struct {
 
 // Intent sides, carried in Intent.Side.
 const (
-	IntentOpen  = "open"
-	IntentClose = "close"
+	IntentOpen   = "open"
+	IntentClose  = "close"
+	IntentResize = "resize"
 )
 
-// Intent is a strategy decision to open or close the delta-neutral position.
+// Intent is a strategy decision to open, close or resize the delta-neutral position.
 // It travels over JetStream so it survives a crash; order-service dedupes on ID
 // (a repeated at-least-once delivery must not open a second position).
 type Intent struct {
 	ID        string    `json:"id"` // unique per decision; downstream dedup key
 	Symbol    string    `json:"symbol"`
-	Side      string    `json:"side"`   // IntentOpen | IntentClose
-	Reason    string    `json:"reason"` // human-readable trigger
+	Side      string    `json:"side"`          // IntentOpen | IntentClose | IntentResize
+	Qty       float64   `json:"qty,omitempty"` // resize only: signed base-coin change of both legs (negative shrinks)
+	Reason    string    `json:"reason"`        // human-readable trigger
 	Funding   float64   `json:"funding"`
 	PerpPrice float64   `json:"perp_price"`
 	SpotPrice float64   `json:"spot_price"`
@@ -73,8 +82,8 @@ type Intent struct {
 type ExecReport struct {
 	IntentID    string    `json:"intent_id"`
 	Symbol      string    `json:"symbol"`
-	Side        string    `json:"side"` // IntentOpen | IntentClose
-	Qty         float64   `json:"qty"`
+	Side        string    `json:"side"` // IntentOpen | IntentClose | IntentResize
+	Qty         float64   `json:"qty"`  // position size; on a resize the signed change that filled
 	SpotOrderID string    `json:"spot_order_id,omitempty"`
 	PerpOrderID string    `json:"perp_order_id,omitempty"`
 	SpotPrice   float64   `json:"spot_price,omitempty"` // fill prices/fees per leg, for portfolio P&L
@@ -106,6 +115,17 @@ type Reconciled struct {
 	SpotSize   float64   `json:"spot_size"`
 	Collateral float64   `json:"collateral"`
 	OpenOrders int       `json:"open_orders"`
+	Time       time.Time `json:"time"`
+}
+
+// AccountState is order-service's periodic view of a held pair, published on
+// SubjAccountState while the position is open. Strategy sizes rebalances from
+// it: Collateral against the short's notional is the distance to liquidation.
+type AccountState struct {
+	Symbol     string    `json:"symbol"`
+	PerpSize   float64   `json:"perp_size"` // signed; short negative
+	SpotSize   float64   `json:"spot_size"`
+	Collateral float64   `json:"collateral"` // quote currency margining the short, perp PnL included
 	Time       time.Time `json:"time"`
 }
 

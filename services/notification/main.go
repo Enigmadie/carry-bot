@@ -3,7 +3,7 @@
 // state — and exists because the halt logic in order-service is only useful if
 // somebody finds out: an unbalanced position parks the bot until a person acts.
 //
-// It relays position opens/closes, terminal failures (which include every ALERT
+// It relays position opens/closes/resizes, terminal failures (which include every ALERT
 // order-service raises before halting), and reconcile snapshots with an
 // unbalanced verdict; clean snapshots and funding settlements stay in
 // Grafana where they belong.
@@ -142,7 +142,7 @@ func (s *service) run(ctx context.Context) error {
 		Durable:        durableName,
 		AckPolicy:      jetstream.AckExplicitPolicy,
 		DeliverPolicy:  jetstream.DeliverNewPolicy,
-		FilterSubjects: []string{events.SubjPositionOpened, events.SubjPositionClosed, events.SubjExecFailed, events.SubjReconciled},
+		FilterSubjects: []string{events.SubjPositionOpened, events.SubjPositionClosed, events.SubjPositionResized, events.SubjExecFailed, events.SubjReconciled},
 		AckWait:        ackWait,
 		MaxDeliver:     maxDeliver,
 	})
@@ -230,6 +230,9 @@ func format(subject string, data []byte) (kind, text string, err error) {
 			r.Symbol, r.Qty, r.SpotPrice, r.PerpPrice, r.Fee) + reason, nil
 	case events.SubjPositionClosed:
 		return "closed", fmt.Sprintf("⚪ CLOSED %s qty=%v\nspot=%v perp=%v fee=%v",
+			r.Symbol, r.Qty, r.SpotPrice, r.PerpPrice, r.Fee) + reason, nil
+	case events.SubjPositionResized:
+		return "resized", fmt.Sprintf("🔁 RESIZED %s by %+g\nspot=%v perp=%v fee=%v",
 			r.Symbol, r.Qty, r.SpotPrice, r.PerpPrice, r.Fee) + reason, nil
 	case events.SubjExecFailed:
 		return "failed", fmt.Sprintf("⚠️ FAILED %s %s\n%s", r.Side, r.Symbol, r.Error), nil

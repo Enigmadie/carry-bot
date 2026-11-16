@@ -14,6 +14,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"strconv"
 	"sync"
 	"time"
@@ -38,6 +39,9 @@ const (
 	mockFundingRate = 0.0001 // 0.01% per settlement
 	mockFundingQty  = 0.001  // nominal base-coin notional for the synthetic accrual
 )
+
+// mockCollateral is the quote balance a fresh mock account starts with.
+const mockCollateral = 1000.0
 
 var (
 	errDuplicate = errors.New("mock: duplicate orderLinkId")
@@ -69,6 +73,8 @@ type Exchange struct {
 	// rest of the mock: a restart forgets it and reconciles as flat.
 	perpSize   float64 // signed; our short goes negative
 	spotSize   float64
+	perpEntry  float64   // average entry price of the held short
+	cash       float64   // quote balance: moved by spot trades, fees and realized perp PnL
 	perpOpenAt time.Time // when the short opened; adlAfter counts from here
 	adlBitten  bool      // first (partial) ADL bite applied; keeps the bite idempotent
 }
@@ -86,7 +92,15 @@ const adlPartialFraction = 0.3
 // the perp off, leaving the orphaned spot the halted tick must catch and
 // repair.
 func New(failCategory string, adlAfter time.Duration) *Exchange {
-	return &Exchange{failCategory: failCategory, adlAfter: adlAfter, seen: map[string]string{}}
+	return &Exchange{failCategory: failCategory, adlAfter: adlAfter, seen: map[string]string{}, cash: mockCollateral}
+}
+
+// SetCollateral replaces the starting quote balance, so a paper run can mirror
+// the size of the account it rehearses for. Call before trading.
+func (m *Exchange) SetCollateral(v float64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.cash = v
 }
 
 // UsePrices turns on paper mode: fills print at mkt's live mark, moved adverse by
@@ -130,8 +144,18 @@ func (m *Exchange) PlaceOrder(ctx context.Context, req exchange.OrderRequest) (*
 	if req.Side == exchange.SideSell {
 		delta = -qty
 	}
+	fee := qty * price * feeRate
+	m.cash -= fee
 	if req.Category == exchange.CategoryLinear {
 		wasFlat := m.perpSize == 0
+		if delta < 0 {
+			// Adding to the short: the entry becomes the size-weighted average.
+			held := -m.perpSize
+			m.perpEntry = (m.perpEntry*held + price*qty) / (held + qty)
+		} else {
+			// Buying back realizes the PnL of the part that closes.
+			m.cash += math.Max(0, math.Min(qty, -m.perpSize)) * (m.perpEntry - price)
+		}
 		m.perpSize += delta
 		if wasFlat && m.perpSize < 0 {
 			m.perpOpenAt = time.Now()
@@ -139,13 +163,14 @@ func (m *Exchange) PlaceOrder(ctx context.Context, req exchange.OrderRequest) (*
 		}
 	} else {
 		m.spotSize += delta
+		m.cash -= delta * price
 	}
 
 	return &exchange.OrderResult{
 		OrderID:     orderID,
 		OrderLinkID: req.OrderLinkID,
 		Price:       price,
-		Fee:         qty * price * feeRate,
+		Fee:         fee,
 		FilledQty:   qty,
 	}, nil
 }
@@ -197,7 +222,24 @@ func (m *Exchange) Funding(ctx context.Context, symbol string, since time.Time) 
 
 // State reports the fill-tracked position, so order-service's startup
 // reconciliation sees the same shape of truth a real exchange would give it.
-func (m *Exchange) State(_ context.Context, _ string) (*exchange.PositionState, error) {
+//
+// Collateral follows the unified-account convention order-service reads from
+// Hyperliquid: the quote balance with the short's unrealized PnL folded in, so
+// it shrinks as the price rises against the short.
+func (m *Exchange) State(ctx context.Context, symbol string) (*exchange.PositionState, error) {
+	m.mu.Lock()
+	mkt, held := m.market, m.perpSize < 0
+	m.mu.Unlock()
+	// Marked before the lock, like fillPrice. Offline the mark is the constant
+	// every fill prints at, so unrealized PnL is zero by construction.
+	mark := mockPrice
+	if mkt != nil && held {
+		var err error
+		if mark, err = mkt.Mark(ctx, exchange.CategoryLinear, symbol); err != nil {
+			return nil, fmt.Errorf("mock: mark for %s: %w", symbol, err)
+		}
+	}
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	// ADL happens on the exchange's clock, not through PlaceOrder, so it is
@@ -214,7 +256,7 @@ func (m *Exchange) State(_ context.Context, _ string) (*exchange.PositionState, 
 	return &exchange.PositionState{
 		PerpSize:   m.perpSize,
 		SpotSize:   m.spotSize,
-		Collateral: 1000,
+		Collateral: m.cash + -m.perpSize*(m.perpEntry-mark),
 	}, nil
 }
 

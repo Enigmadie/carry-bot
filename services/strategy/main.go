@@ -44,11 +44,11 @@ const (
 var (
 	intentsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: metrics.Namespace, Subsystem: "strategy",
-		Name: "intents_total", Help: "Intents published to JetStream, by side (open|close).",
+		Name: "intents_total", Help: "Intents published to JetStream, by side (open|close|resize).",
 	}, []string{"side"})
 	stateGauge = promauto.NewGauge(prometheus.GaugeOpts{
 		Namespace: metrics.Namespace, Subsystem: "strategy",
-		Name: "state", Help: "Position state machine: 0 flat, 1 open, 2 pending open, 3 pending close, -1 halted.",
+		Name: "state", Help: "Position state machine: 0 flat, 1 open, 2 pending open, 3 pending close, 4 pending resize, -1 halted.",
 	})
 	publishErrors = promauto.NewCounter(prometheus.CounterOpts{
 		Namespace: metrics.Namespace, Subsystem: "strategy",
@@ -58,6 +58,10 @@ var (
 		Namespace: metrics.Namespace, Subsystem: "strategy",
 		Name: "gated_total", Help: "Funding ticks that met the entry threshold but were blocked from opening, by reason (basis|cooldown|no-price).",
 	}, []string{"reason"})
+	marginRatio = promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: metrics.Namespace, Subsystem: "strategy",
+		Name: "margin_ratio", Help: "Collateral over the short's notional at the last account snapshot; the short is liquidated near the exchange's maintenance fraction.",
+	})
 )
 
 type config struct {
@@ -68,6 +72,15 @@ type config struct {
 	MaxBasis       float64       // open only when |perp−spot|/spot <= this; <=0 disables
 	ReopenCooldown time.Duration // quiet period after a forced close; 0 disables
 	MetricsAddr    string
+
+	// Rebalancing keeps collateral/short-notional near TargetMargin by resizing
+	// both legs: shrink below RebalanceLow, grow above RebalanceHigh.
+	TargetMargin     float64       // 0 disables rebalancing altogether
+	RebalanceLow     float64       // must sit between the liquidation level and TargetMargin
+	RebalanceHigh    float64       // 0 disables growing
+	RebalanceMinNtl  float64       // skip resizes below this notional (exchange minimum order)
+	RebalanceStep    float64       // lot size the resize qty is truncated to
+	RebalanceCooloff time.Duration // quiet period after a resize intent, success or not
 }
 
 func loadConfig() config {
@@ -79,7 +92,32 @@ func loadConfig() config {
 		MaxBasis:       getfloat("MAX_BASIS", 0.01),
 		ReopenCooldown: getdur("REOPEN_COOLDOWN", 30*time.Minute),
 		MetricsAddr:    getenv("METRICS_ADDR", ":2113"),
+
+		TargetMargin:     getfloat("TARGET_MARGIN_RATIO", 0),
+		RebalanceLow:     getfloat("REBALANCE_LOW", 0.25),
+		RebalanceHigh:    getfloat("REBALANCE_HIGH", 0),
+		RebalanceMinNtl:  getfloat("REBALANCE_MIN_NOTIONAL", 11),
+		RebalanceStep:    getfloat("REBALANCE_QTY_STEP", 0.01),
+		RebalanceCooloff: getdur("REBALANCE_COOLDOWN", 5*time.Minute),
 	}
+}
+
+// validate rejects a rebalance band that could never work: a misordered one
+// would resize on every snapshot, or never before liquidation.
+func (c config) validate() error {
+	if c.TargetMargin <= 0 {
+		return nil
+	}
+	if c.RebalanceLow <= 0 || c.RebalanceLow >= c.TargetMargin {
+		return fmt.Errorf("REBALANCE_LOW %v must be in (0, TARGET_MARGIN_RATIO %v)", c.RebalanceLow, c.TargetMargin)
+	}
+	if c.RebalanceHigh != 0 && c.RebalanceHigh <= c.TargetMargin {
+		return fmt.Errorf("REBALANCE_HIGH %v must be 0 or above TARGET_MARGIN_RATIO %v", c.RebalanceHigh, c.TargetMargin)
+	}
+	if c.RebalanceStep <= 0 {
+		return fmt.Errorf("REBALANCE_QTY_STEP %v must be positive", c.RebalanceStep)
+	}
+	return nil
 }
 
 // position is the in-memory state machine, rebuilt on every start by replaying
@@ -95,6 +133,7 @@ const (
 	open
 	pendingOpen
 	pendingClose
+	pendingResize
 	halted
 )
 
@@ -108,6 +147,8 @@ func (p position) String() string {
 		return "pending-open"
 	case pendingClose:
 		return "pending-close"
+	case pendingResize:
+		return "pending-resize"
 	case halted:
 		return "halted"
 	}
@@ -116,7 +157,7 @@ func (p position) String() string {
 
 // gauge values match the stateGauge help text.
 var stateGaugeValue = map[position]float64{
-	flat: 0, open: 1, pendingOpen: 2, pendingClose: 3, halted: -1,
+	flat: 0, open: 1, pendingOpen: 2, pendingClose: 3, pendingResize: 4, halted: -1,
 }
 
 func (s *service) setState(p position, why string) {
@@ -128,14 +169,15 @@ func (s *service) setState(p position, why string) {
 	stateGauge.Set(stateGaugeValue[p])
 }
 
-// tick is one normalised market update fanned in from the three subscriptions.
+// tick is one normalised update fanned in from the core-NATS subscriptions.
 // Funneling every event through a single channel lets one goroutine own all
 // mutable state, so we never need a mutex. The Go idiom: don't communicate by
 // sharing memory; share memory by communicating.
 type tick struct {
-	kind    string // "perp" | "spot" | "funding"
+	kind    string // "perp" | "spot" | "funding" | "account"
 	price   float64
 	funding events.FundingRate
+	account events.AccountState
 }
 
 type service struct {
@@ -154,6 +196,11 @@ type service struct {
 	// day-old fact doesn't re-arm it on restart.
 	cooldownUntil time.Time
 
+	// resizeAfter spaces resize intents out: the snapshot that triggered one is
+	// stale until order-service polls again, and a resize the exchange rejects
+	// would otherwise be re-sent on every snapshot.
+	resizeAfter time.Time
+
 	// lastGate is the reason entry was last blocked, so a standing block is
 	// logged once instead of on every funding tick.
 	lastGate string
@@ -168,6 +215,10 @@ type service struct {
 func main() {
 	log := slog.New(slog.NewTextHandler(os.Stdout, nil))
 	cfg := loadConfig()
+	if err := cfg.validate(); err != nil {
+		log.Error("config", "err", err)
+		os.Exit(1)
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -233,7 +284,7 @@ func (s *service) run(ctx context.Context, nc *nats.Conn) error {
 	}
 
 	execSubjects := []string{
-		events.SubjPositionOpened, events.SubjPositionClosed,
+		events.SubjPositionOpened, events.SubjPositionClosed, events.SubjPositionResized,
 		events.SubjExecFailed, events.SubjReconciled,
 	}
 
@@ -291,6 +342,7 @@ func (s *service) run(ctx context.Context, nc *nats.Conn) error {
 		{events.SubjPricePerp, parsePrice("perp")},
 		{events.SubjPriceSpot, parsePrice("spot")},
 		{events.SubjFundingSettled, parseFunding},
+		{events.SubjAccountState, parseAccount},
 	}
 	for _, sub := range subs {
 		parse := sub.parse
@@ -314,6 +366,10 @@ func (s *service) run(ctx context.Context, nc *nats.Conn) error {
 	}
 	s.log.Info("subscribed to market data",
 		"entry", s.cfg.EntryThreshold, "exit", s.cfg.ExitThreshold)
+	if s.cfg.TargetMargin > 0 {
+		s.log.Info("rebalancing enabled", "target", s.cfg.TargetMargin,
+			"low", s.cfg.RebalanceLow, "high", s.cfg.RebalanceHigh)
+	}
 
 	for {
 		select {
@@ -351,7 +407,7 @@ func (s *service) onExec(m jetstream.Msg) {
 				"perp", r.PerpSize, "spot", r.SpotSize)
 			s.setState(halted, "reconciled unbalanced")
 		}
-	case events.SubjPositionOpened, events.SubjPositionClosed, events.SubjExecFailed:
+	case events.SubjPositionOpened, events.SubjPositionClosed, events.SubjPositionResized, events.SubjExecFailed:
 		var r events.ExecReport
 		if err := json.Unmarshal(m.Data(), &r); err != nil {
 			s.log.Error("unmarshal exec report", "err", err)
@@ -375,11 +431,16 @@ func (s *service) onExec(m jetstream.Msg) {
 				}
 			}
 			s.setState(flat, "exec closed "+r.IntentID)
+		case events.SubjPositionResized:
+			s.setState(open, "exec resized "+r.IntentID)
 		case events.SubjExecFailed:
-			if s.state == pendingOpen && r.Side == events.IntentOpen {
+			switch {
+			case s.state == pendingOpen && r.Side == events.IntentOpen:
 				s.setState(flat, "open failed "+r.IntentID)
-			} else if s.state == pendingClose && r.Side == events.IntentClose {
+			case s.state == pendingClose && r.Side == events.IntentClose:
 				s.setState(open, "close failed "+r.IntentID)
+			case s.state == pendingResize && r.Side == events.IntentResize:
+				s.setState(open, "resize failed "+r.IntentID)
 			}
 		}
 	}
@@ -411,7 +472,69 @@ func (s *service) onTick(ctx context.Context, t tick) {
 		s.spotPrice = t.price
 	case "funding":
 		s.evaluate(ctx, t.funding)
+	case "account":
+		s.rebalance(ctx, t.account)
 	}
+}
+
+// rebalance is the margin trigger, run on every account snapshot of a held
+// pair. The exchange does not count the spot leg as collateral for the short,
+// so a rising price drains the short's margin while the matching gain sits in
+// spot; resizing both legs moves that gain across (or, on a falling price,
+// puts idle margin to work) without touching the hedge.
+func (s *service) rebalance(ctx context.Context, a events.AccountState) {
+	if s.cfg.TargetMargin <= 0 || a.Symbol != s.cfg.Symbol {
+		return
+	}
+	delta, ratio := rebalanceDelta(s.cfg, a, s.spotPrice, s.perpPrice)
+	marginRatio.Set(ratio)
+	if delta == 0 || !s.seeded || s.state != open || time.Now().Before(s.resizeAfter) {
+		return
+	}
+	// Growing is an entry in miniature, so it answers to the same gate;
+	// shrinking only buys distance from liquidation and is never blocked.
+	if delta > 0 && s.openGate() != "" {
+		return
+	}
+	s.resizeAfter = time.Now().Add(s.cfg.RebalanceCooloff)
+	s.emit(ctx, events.SubjIntentResize, events.Intent{
+		Side: events.IntentResize,
+		Qty:  delta,
+		Reason: fmt.Sprintf("margin ratio %.3f outside [%.3f, %.3f], target %.3f",
+			ratio, s.cfg.RebalanceLow, s.cfg.RebalanceHigh, s.cfg.TargetMargin),
+	})
+}
+
+// rebalanceDelta returns the signed base-coin change of both legs that brings
+// collateral/short-notional back to the target, and the ratio it saw; delta is
+// zero inside the band or when the move is too small to trade.
+//
+// Changing the pair by d coins costs d·spot of collateral (the spot leg is
+// paid for, or pays out, in quote) while the short's notional becomes
+// (q+d)·perp. Solving (C − d·spot) / ((q+d)·perp) = target for d gives the
+// formula below. Fees and slippage are left out; they cost a few basis points
+// of the resized slice, well inside the band.
+func rebalanceDelta(cfg config, a events.AccountState, spot, perp float64) (delta, ratio float64) {
+	q := -a.PerpSize
+	if q <= 0 || spot <= 0 || perp <= 0 {
+		return 0, 0
+	}
+	ratio = a.Collateral / (q * perp)
+	shrink := ratio < cfg.RebalanceLow
+	grow := cfg.RebalanceHigh > 0 && ratio > cfg.RebalanceHigh
+	if !shrink && !grow {
+		return 0, ratio
+	}
+	d := (a.Collateral - cfg.TargetMargin*q*perp) / (spot + cfg.TargetMargin*perp)
+	// Whole lots, rounded down in both directions: a smaller grow and a larger
+	// shrink both err toward more margin. The epsilon keeps 0.33/0.01 from
+	// landing on 32.999… lots.
+	lots := math.Floor(d/cfg.RebalanceStep + 1e-9)
+	d = math.Round(lots*cfg.RebalanceStep*1e8) / 1e8
+	if math.Abs(d)*perp < cfg.RebalanceMinNtl || (q+d)*perp < cfg.RebalanceMinNtl {
+		return 0, ratio
+	}
+	return d, ratio
 }
 
 // evaluate is the entry/exit trigger. Hysteresis (Exit < Entry) stops the
@@ -438,13 +561,13 @@ func (s *service) evaluate(ctx context.Context, fr events.FundingRate) {
 			s.lastGate = ""
 			reason := fmt.Sprintf("funding %.4f%% >= %.4f%%",
 				fr.Rate*100, s.cfg.EntryThreshold*100)
-			s.emit(ctx, events.SubjIntentOpen, events.IntentOpen, reason, fr)
+			s.emit(ctx, events.SubjIntentOpen, events.Intent{Side: events.IntentOpen, Reason: reason, Funding: fr.Rate})
 		}
 	case open:
 		if fr.Rate <= s.cfg.ExitThreshold {
 			reason := fmt.Sprintf("funding %.4f%% <= %.4f%%",
 				fr.Rate*100, s.cfg.ExitThreshold*100)
-			s.emit(ctx, events.SubjIntentClose, events.IntentClose, reason, fr)
+			s.emit(ctx, events.SubjIntentClose, events.Intent{Side: events.IntentClose, Reason: reason, Funding: fr.Rate})
 		}
 	}
 }
@@ -474,7 +597,7 @@ func (s *service) openGate() string {
 	return ""
 }
 
-// emit publishes an intent to JetStream and moves the state machine to the
+// emit stamps and publishes an intent to JetStream and moves the state machine to the
 // matching pending state once the server acks the write — the confirmed flip
 // only happens when the execution fact comes back (see onExec). js.Publish is
 // synchronous: unlike core NATS' fire-and-forget Publish (used in market-data),
@@ -483,17 +606,13 @@ func (s *service) openGate() string {
 // silently lose a close signal. WithMsgID sets the JetStream dedup key, so a
 // retried publish of the same intent ID is collapsed server-side within the
 // dedup window.
-func (s *service) emit(ctx context.Context, subj, side, reason string, fr events.FundingRate) {
-	intent := events.Intent{
-		ID:        nuid.Next(),
-		Symbol:    s.cfg.Symbol,
-		Side:      side,
-		Reason:    reason,
-		Funding:   fr.Rate,
-		PerpPrice: s.perpPrice,
-		SpotPrice: s.spotPrice,
-		Time:      time.Now().UTC(),
-	}
+func (s *service) emit(ctx context.Context, subj string, intent events.Intent) {
+	side := intent.Side
+	intent.ID = nuid.Next()
+	intent.Symbol = s.cfg.Symbol
+	intent.PerpPrice = s.perpPrice
+	intent.SpotPrice = s.spotPrice
+	intent.Time = time.Now().UTC()
 	data, err := json.Marshal(intent)
 	if err != nil {
 		s.log.Error("marshal intent", "err", err)
@@ -507,14 +626,17 @@ func (s *service) emit(ctx context.Context, subj, side, reason string, fr events
 		return // state unchanged → retried on the next funding tick
 	}
 
-	if side == events.IntentOpen {
+	switch side {
+	case events.IntentOpen:
 		s.setState(pendingOpen, "intent published "+intent.ID)
-	} else {
+	case events.IntentClose:
 		s.setState(pendingClose, "intent published "+intent.ID)
+	case events.IntentResize:
+		s.setState(pendingResize, "intent published "+intent.ID)
 	}
 	intentsTotal.WithLabelValues(side).Inc()
 	s.log.Info("intent published",
-		"side", side, "reason", reason, "id", intent.ID,
+		"side", side, "qty", intent.Qty, "reason", intent.Reason, "id", intent.ID,
 		"stream", ack.Stream, "seq", ack.Sequence)
 }
 
@@ -535,6 +657,14 @@ func parseFunding(data []byte) (tick, bool) {
 		return tick{}, false
 	}
 	return tick{kind: "funding", funding: fr}, true
+}
+
+func parseAccount(data []byte) (tick, bool) {
+	var a events.AccountState
+	if err := json.Unmarshal(data, &a); err != nil {
+		return tick{}, false
+	}
+	return tick{kind: "account", account: a}, true
 }
 
 func getenv(key, def string) string {

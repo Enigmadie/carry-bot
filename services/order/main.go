@@ -73,7 +73,7 @@ var (
 	}, []string{"category", "side", "result"})
 	intentsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: metrics.Namespace, Subsystem: "order",
-		Name: "intents_total", Help: "Intents settled, by side and outcome (opened|closed|failed).",
+		Name: "intents_total", Help: "Intents settled, by side and outcome (opened|closed|resized|failed).",
 	}, []string{"side", "outcome"})
 	rollbacksTotal = promauto.NewCounter(prometheus.CounterOpts{
 		Namespace: metrics.Namespace, Subsystem: "order",
@@ -127,6 +127,7 @@ type config struct {
 	PaperPrices  bool          // mock only: fill against live marks and real funding instead of constants
 	PaperFee     float64       // mock paper only: taker fee charged per fill
 	PaperSlip    float64       // mock paper only: adverse offset from the mark a fill prints at
+	MockCollat   float64       // mock only: starting quote balance; 0 → mock default
 
 	HLAPI        string  // hyperliquid REST host; "" → testnet
 	HLWS         string  // hyperliquid WS host for user fills; "" → follows HLMainnet
@@ -160,6 +161,7 @@ func loadConfig() config {
 		PaperPrices:  getbool("PAPER_PRICES", false),
 		PaperFee:     getfloat("PAPER_FEE", 0.00045),
 		PaperSlip:    getfloat("PAPER_SLIPPAGE", 0.0005),
+		MockCollat:   getfloat("MOCK_COLLATERAL", 0),
 
 		HLAPI:        os.Getenv("HL_API"),
 		HLWS:         os.Getenv("HL_WS"),
@@ -201,6 +203,15 @@ type service struct {
 	// doesn't accumulate unattached payments while flat.
 	positionOpen atomic.Bool
 
+	// heldQty is the size of the pair actually held, in base coin: ORDER_QTY at
+	// open, moved by every resize, re-read from the exchange at reconcile. Zero
+	// while flat. Worker goroutine only.
+	heldQty float64
+
+	// publishState sends an account snapshot on core NATS (nc.Publish): the
+	// stream of them is latest-value-wins, so it needs no JetStream ack.
+	publishState func(subj string, data []byte) error
+
 	// nudge carries the dir of a user fill the bot did not place (ADL,
 	// liquidation, a manual order), sent by the user-fills WS watcher
 	// (userfills.go) to trigger an immediate reconcile on the worker loop.
@@ -217,6 +228,9 @@ func buildExchange(ctx context.Context, cfg config) (exchange.Exchange, error) {
 	switch cfg.Provider {
 	case "mock":
 		m := mock.New(cfg.MockFailLeg, cfg.MockADLAfter)
+		if cfg.MockCollat > 0 {
+			m.SetCollateral(cfg.MockCollat)
+		}
 		if cfg.PaperPrices {
 			// Read-only client: no signing key, so it can price and read funding but
 			// physically cannot place an order — the guarantee a shadow run rests on.
@@ -312,6 +326,8 @@ func main() {
 		ex:    ex,
 		cfg:   cfg,
 		nudge: make(chan string, 1),
+
+		publishState: nc.Publish,
 	}
 
 	if err := s.run(ctx); err != nil && ctx.Err() == nil {
@@ -351,7 +367,7 @@ func (s *service) run(ctx context.Context) error {
 	cons, err := s.js.CreateOrUpdateConsumer(ctx, intentStream, jetstream.ConsumerConfig{
 		Durable:        durableName,
 		AckPolicy:      jetstream.AckExplicitPolicy,
-		FilterSubjects: []string{events.SubjIntentOpen, events.SubjIntentClose},
+		FilterSubjects: []string{events.SubjIntentOpen, events.SubjIntentClose, events.SubjIntentResize},
 		AckWait:        ackWait,
 		MaxDeliver:     maxDeliver,
 	})
@@ -408,32 +424,37 @@ func (s *service) run(ctx context.Context) error {
 	}
 }
 
-// Leg-size tolerances for reconciliation, as fractions of ORDER_QTY. A leg
-// counts as held from 90% — the spot balance runs slightly under the ordered
-// qty because Hyperliquid takes the spot fee in the received token — and as
-// absent up to 10% (dust). Anything in between matches neither picture.
+// Leg-size tolerances for reconciliation. Dust is absolute — up to 10% of
+// ORDER_QTY counts as nothing held. The pair itself is judged leg against leg,
+// not against ORDER_QTY, because a resize moves the held size away from it:
+// the spot leg matches the short from 90% of it (Hyperliquid takes the spot
+// fee in the received token) up to 10% over, plus dust. Anything else matches
+// neither picture.
 const (
 	legFullFraction = 0.9
 	legDustFraction = 0.1
 )
 
-// classifyState maps the exchange's live position onto a reconcile verdict.
-// Anything that is neither cleanly flat nor cleanly both-legs-open — including
+// classifyState maps the exchange's live position onto a reconcile verdict;
+// qty is the configured ORDER_QTY, which only scales the dust floor. Anything
+// that is neither cleanly flat nor a short matched by its spot leg — including
 // a perp long (we only ever short) and resting orders (we trade IOC only) —
 // is unbalanced and must halt trading for a human.
 func classifyState(st *exchange.PositionState, qty float64) string {
+	dust := qty * legDustFraction
 	short := -st.PerpSize // held short comes back positive
-	perpOpen := short >= qty*legFullFraction
-	perpFlat := short <= qty*legDustFraction && st.PerpSize <= qty*legDustFraction
-	spotOpen := st.SpotSize >= qty*legFullFraction
-	spotFlat := st.SpotSize <= qty*legDustFraction
+	perpFlat := math.Abs(st.PerpSize) <= dust
+	spotFlat := st.SpotSize <= dust
+	paired := short > dust &&
+		st.SpotSize >= short*legFullFraction &&
+		st.SpotSize <= short*(1+legDustFraction)+dust
 
 	switch {
 	case st.OpenOrders > 0:
 		return events.ReconcileUnbalanced
 	case perpFlat && spotFlat:
 		return events.ReconcileFlat
-	case perpOpen && spotOpen:
+	case paired:
 		return events.ReconcileOpen
 	default:
 		return events.ReconcileUnbalanced
@@ -445,6 +466,7 @@ func classifyState(st *exchange.PositionState, qty float64) string {
 // leg is intact within the same tolerances an open leg is judged by (a small
 // upper margin covers accumulated fee dust), and nothing is resting. Every
 // other unbalanced shape implies a human or a bug and stays on the halt path.
+// qty is the size the pair was last known to hold.
 func isOrphanSpot(st *exchange.PositionState, qty float64) bool {
 	return st.OpenOrders == 0 &&
 		math.Abs(st.PerpSize) <= qty*legDustFraction &&
@@ -461,11 +483,11 @@ func (s *service) observeState(ctx context.Context) (*exchange.PositionState, st
 	if err != nil {
 		return nil, "", err
 	}
-	verdict := classifyState(st, s.qty())
+	verdict := classifyState(st, s.orderQty())
 	if verdict == events.ReconcileUnbalanced && s.cfg.OrphanAutoClose && isOrphanSpot(st, s.qty()) {
 		if fresh, ok := s.autoCloseOrphan(ctx, st); ok {
 			st = fresh
-			verdict = classifyState(st, s.qty())
+			verdict = classifyState(st, s.orderQty())
 		}
 	}
 	return st, verdict, nil
@@ -552,6 +574,10 @@ func (s *service) reconcileTick(ctx context.Context) {
 		want = events.ReconcileOpen
 	}
 	if verdict == want {
+		if verdict == events.ReconcileOpen {
+			s.heldQty = -st.PerpSize
+			s.publishAccountState(st)
+		}
 		return
 	}
 
@@ -620,6 +646,22 @@ func haltShape(st *exchange.PositionState, verdict string) string {
 	return fmt.Sprintf("%s|%v|%v|%d", verdict, st.PerpSize, st.SpotSize, st.OpenOrders)
 }
 
+// publishAccountState hands strategy the numbers it sizes rebalances from. A
+// lost snapshot costs nothing: the next reconcile tick sends a fresher one.
+func (s *service) publishAccountState(st *exchange.PositionState) {
+	data, err := json.Marshal(events.AccountState{
+		Symbol: s.cfg.Symbol, PerpSize: st.PerpSize, SpotSize: st.SpotSize,
+		Collateral: st.Collateral, Time: time.Now().UTC(),
+	})
+	if err != nil {
+		s.log.Error("marshal account state", "err", err)
+		return
+	}
+	if err := s.publishState(events.SubjAccountState, data); err != nil {
+		s.log.Warn("publish account state", "err", err)
+	}
+}
+
 func (s *service) publishReconciled(ctx context.Context, st *exchange.PositionState, verdict string) error {
 	rep := events.Reconciled{
 		Symbol: s.cfg.Symbol, Verdict: verdict,
@@ -647,8 +689,10 @@ func (s *service) applyVerdict(st *exchange.PositionState, verdict string) {
 	switch verdict {
 	case events.ReconcileOpen:
 		s.positionOpen.Store(true)
+		s.heldQty = -st.PerpSize
 	case events.ReconcileFlat:
 		s.positionOpen.Store(false)
+		s.heldQty = 0
 	case events.ReconcileUnbalanced:
 		s.halted = true
 		// Seed the change-gate with the shape that caused the halt: it was just
@@ -687,6 +731,8 @@ func (s *service) handle(ctx context.Context, m jetstream.Msg) {
 		err = s.openPosition(ctx, intent)
 	case events.IntentClose:
 		err = s.closePosition(ctx, intent)
+	case events.IntentResize:
+		err = s.resizePosition(ctx, intent)
 	default:
 		s.log.Error("unknown intent side", "side", intent.Side, "id", intent.ID)
 		m.Term()
@@ -807,7 +853,7 @@ func (s *service) closePosition(ctx context.Context, in events.Intent) error {
 		Category:    exchange.CategoryLinear,
 		Symbol:      in.Symbol,
 		Side:        exchange.SideBuy,
-		Qty:         s.cfg.OrderQty,
+		Qty:         fmtQty(s.qty()),
 		OrderLinkID: legID(in.ID, "p"),
 		ReduceOnly:  true,
 	})
@@ -836,13 +882,118 @@ func (s *service) closePosition(ctx context.Context, in events.Intent) error {
 	return nil
 }
 
+// resizePosition changes both legs of the held pair by the intent's signed Qty
+// and keeps them equal, reusing the choreography of the move it resembles.
+// Growing is a small open: spot first, perp second, the bought spot sold back
+// if the perp fails. Shrinking is a small close: reduce-only perp first, spot
+// second, and a failed spot sell leaves the pair unbalanced → halt. The second
+// leg trades what the first one actually filled, so a partial IOC fill or the
+// exchange's lot rounding cannot open a gap between the legs.
+func (s *service) resizePosition(ctx context.Context, in events.Intent) error {
+	// Same guard as closePosition: with nothing held there is no pair to resize.
+	if !s.positionOpen.Load() {
+		s.log.Warn("resize intent with no open position, dropping and re-reconciling", "id", in.ID)
+		if err := s.reconcile(ctx); err != nil {
+			s.log.Warn("re-reconcile after stale intent", "err", err)
+		}
+		return nil
+	}
+	size := math.Abs(in.Qty)
+	if size == 0 || (in.Qty < 0 && size >= s.qty()) {
+		// A shrink of the whole position is a close and must arrive as one.
+		s.emitFailed(ctx, in, fmt.Sprintf("resize rejected: qty %v against held %v", in.Qty, s.qty()))
+		return nil
+	}
+
+	grow := in.Qty > 0
+	first := exchange.OrderRequest{
+		Category: exchange.CategorySpot, Symbol: in.Symbol, Side: exchange.SideBuy,
+		Qty: fmtQty(size), OrderLinkID: legID(in.ID, "s"),
+	}
+	second := exchange.OrderRequest{
+		Category: exchange.CategoryLinear, Symbol: in.Symbol, Side: exchange.SideSell,
+		OrderLinkID: legID(in.ID, "p"),
+	}
+	if !grow {
+		first = exchange.OrderRequest{
+			Category: exchange.CategoryLinear, Symbol: in.Symbol, Side: exchange.SideBuy,
+			Qty: fmtQty(size), OrderLinkID: legID(in.ID, "p"), ReduceOnly: true,
+		}
+		second = exchange.OrderRequest{
+			Category: exchange.CategorySpot, Symbol: in.Symbol, Side: exchange.SideSell,
+			OrderLinkID: legID(in.ID, "s"),
+		}
+	}
+
+	a, err := s.placeLeg(ctx, in, first)
+	if err != nil {
+		// Nothing changed yet. Terminal → record and stop; otherwise redeliver.
+		if s.ex.Classify(err) == exchange.ErrTerminal {
+			s.emitFailed(ctx, in, "resize "+first.Category+" leg failed: "+err.Error())
+			return nil
+		}
+		return fmt.Errorf("resize %s leg: %w: %w", first.Category, err, errRetry)
+	}
+	// A replayed leg reports no fill; the size asked for is the best knowledge.
+	filled := size
+	if a.FilledQty > 0 {
+		filled = a.FilledQty
+	}
+	second.Qty = fmtQty(filled)
+
+	b, err := s.placeLeg(ctx, in, second)
+	if err != nil && grow {
+		s.log.Error("resize perp leg failed, rolling back spot", "id", in.ID, "err", err)
+		if _, rbErr := s.placeLeg(ctx, in, exchange.OrderRequest{
+			Category: exchange.CategorySpot, Symbol: in.Symbol, Side: exchange.SideSell,
+			Qty: fmtQty(filled), OrderLinkID: legID(in.ID, "rb"),
+		}); rbErr != nil {
+			s.alert(ctx, in, "RESIZE ROLLBACK FAILED — spot leg larger than the short, manual intervention required: "+rbErr.Error())
+			return nil
+		}
+		rollbacksTotal.Inc()
+		s.emitFailed(ctx, in, "resize perp leg failed, spot rolled back: "+err.Error())
+		return nil
+	}
+	if err != nil {
+		s.alert(ctx, in, "UNBALANCED — short reduced but spot sell failed, manual intervention required: "+err.Error())
+		return nil
+	}
+
+	spot, perp := a, b
+	if !grow {
+		spot, perp = b, a
+	}
+	delta := filled
+	if !grow {
+		delta = -filled
+	}
+	s.fillFees(ctx, spot, perp)
+	s.emit(ctx, events.SubjPositionResized, events.ExecReport{
+		IntentID: in.ID, Symbol: in.Symbol, Side: in.Side, Qty: delta,
+		SpotOrderID: spot.OrderID, PerpOrderID: perp.OrderID,
+		SpotPrice: spot.Price, PerpPrice: perp.Price, Fee: spot.Fee + perp.Fee,
+		Time: time.Now().UTC(),
+	})
+	s.heldQty = s.qty() + delta
+	intentsTotal.WithLabelValues(in.Side, "resized").Inc()
+	s.log.Info("position resized", "id", in.ID, "delta", delta, "held", s.heldQty, "reason", in.Reason)
+	return nil
+}
+
+// fmtQty renders a size the way OrderRequest carries it: plain decimal, no
+// exponent. The provider truncates it to the instrument's lot size.
+func fmtQty(q float64) string {
+	return strconv.FormatFloat(q, 'f', -1, 64)
+}
+
 // spotSellQty sizes the spot sell that unwinds our long from the live balance.
 func (s *service) spotSellQty(ctx context.Context, symbol string) (string, error) {
 	st, err := s.ex.State(ctx, symbol)
 	if err != nil {
 		return "", err
 	}
-	return strconv.FormatFloat(spotSellSize(st.SpotSize, s.qty()), 'f', -1, 64), nil
+	return fmtQty(spotSellSize(st.SpotSize, s.qty())), nil
 }
 
 // spotSellSize is the held spot balance capped at the ordered qty. Hyperliquid
@@ -1014,6 +1165,7 @@ func (s *service) emitOpened(ctx context.Context, in events.Intent, spot, perp *
 		Time: time.Now().UTC(),
 	})
 	s.positionOpen.Store(true)
+	s.heldQty = s.orderQty()
 	intentsTotal.WithLabelValues(in.Side, "opened").Inc()
 	s.log.Info("position opened", "id", in.ID, "reason", in.Reason)
 }
@@ -1027,6 +1179,7 @@ func (s *service) emitClosed(ctx context.Context, in events.Intent, spot, perp *
 		Time: time.Now().UTC(),
 	})
 	s.positionOpen.Store(false)
+	s.heldQty = 0
 	intentsTotal.WithLabelValues(in.Side, "closed").Inc()
 	s.log.Info("position closed", "id", in.ID, "reason", in.Reason)
 }
@@ -1070,11 +1223,21 @@ func (s *service) emit(ctx context.Context, subj string, report events.ExecRepor
 	}
 }
 
-// qty parses the configured order size for reporting; an unparseable value just
-// reports zero, since the orders themselves use the raw string Bybit expects.
-func (s *service) qty() float64 {
+// orderQty parses the configured ORDER_QTY, the size a position opens at; an
+// unparseable value just reports zero, since the open legs themselves use the
+// raw string.
+func (s *service) orderQty() float64 {
 	q, _ := strconv.ParseFloat(s.cfg.OrderQty, 64)
 	return q
+}
+
+// qty is the size of the pair: what is held once known, ORDER_QTY otherwise
+// (flat, or mid-open before the fact is out).
+func (s *service) qty() float64 {
+	if s.heldQty > 0 {
+		return s.heldQty
+	}
+	return s.orderQty()
 }
 
 func getenv(key, def string) string {
