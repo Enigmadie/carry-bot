@@ -975,7 +975,9 @@ func (s *service) resizePosition(ctx context.Context, in events.Intent) error {
 		SpotPrice: spot.Price, PerpPrice: perp.Price, Fee: spot.Fee + perp.Fee,
 		Time: time.Now().UTC(),
 	})
-	s.heldQty = s.qty() + delta
+	// Rounded so float noise can't truncate a lot away when the close order
+	// is sized from it before the next reconcile tick resyncs from the exchange.
+	s.heldQty = math.Round((s.qty()+delta)*1e8) / 1e8
 	intentsTotal.WithLabelValues(in.Side, "resized").Inc()
 	s.log.Info("position resized", "id", in.ID, "delta", delta, "held", s.heldQty, "reason", in.Reason)
 	return nil

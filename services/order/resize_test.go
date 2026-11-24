@@ -60,6 +60,21 @@ func TestResizeGrowAndShrinkKeepLegsEqual(t *testing.T) {
 	}
 }
 
+// 0.64 − 0.22 is 0.42000000000000004 in float64; the live shrink on
+// 2026-11-18 carried exactly that.
+func TestResizeHeldQtyHasNoFloatNoise(t *testing.T) {
+	ex := &hlLike{seen: map[string]bool{}}
+	s, _ := openedService(t, ex)
+	ex.perp, ex.spot, s.heldQty = -0.64, 0.64, 0.64
+
+	if err := s.resizePosition(context.Background(), resize(-0.22)); err != nil {
+		t.Fatalf("shrink: %v", err)
+	}
+	if s.heldQty != 0.42 {
+		t.Fatalf("held = %v, want exactly 0.42", s.heldQty)
+	}
+}
+
 func TestResizeGrowRollsBackSpotWhenPerpFails(t *testing.T) {
 	ex := &hlLike{spotFee: 0.0007, seen: map[string]bool{}}
 	s, js := openedService(t, ex)

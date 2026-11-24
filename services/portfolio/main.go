@@ -11,6 +11,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -34,7 +35,12 @@ const (
 	durableName = "portfolio-service"
 	execMaxAge  = 72 * time.Hour
 	ackWait     = 30 * time.Second
-	maxDeliver  = 5
+
+	// A failed ledger write is retried in place until it lands, backing off up
+	// to retryMaxDelay. Each wait plus one bounded attempt stays under ackWait,
+	// so the InProgress heartbeat between attempts keeps the message ours.
+	retryMaxDelay  = 15 * time.Second
+	attemptTimeout = 10 * time.Second
 
 	// metricsRefresh is how often the ledger aggregates are re-queried into the
 	// gauges. The values come from Postgres, not in-memory counters, so they stay
@@ -58,6 +64,10 @@ var (
 	reconcileMismatch = promauto.NewGauge(prometheus.GaugeOpts{
 		Namespace: metrics.Namespace, Subsystem: "portfolio",
 		Name: "reconcile_mismatch", Help: "1 when the latest exchange reconcile snapshot disagrees with the ledger.",
+	})
+	ledgerStalled = promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: metrics.Namespace, Subsystem: "portfolio",
+		Name: "ledger_stalled", Help: "1 while an exec fact is being retried against Postgres; nothing behind it is booked.",
 	})
 )
 
@@ -187,7 +197,12 @@ func (s *service) run(ctx context.Context) error {
 		AckPolicy:      jetstream.AckExplicitPolicy,
 		FilterSubjects: []string{events.SubjPositionOpened, events.SubjPositionClosed, events.SubjPositionResized, events.SubjExecFailed, events.SubjFundingReceived, events.SubjReconciled},
 		AckWait:        ackWait,
-		MaxDeliver:     maxDeliver,
+		// The ledger is a fold over facts in stream order: a dropped resize
+		// leaves qty wrong for good, and a fact applied after a later one
+		// (a resize after its close) books against the wrong position. So no
+		// delivery cap, and one fact in flight at a time.
+		MaxDeliver:    -1,
+		MaxAckPending: 1,
 	})
 	if err != nil {
 		return fmt.Errorf("ensure consumer: %w", err)
@@ -258,49 +273,91 @@ func (s *service) scrapeMetrics(ctx context.Context) {
 	fundingTotal.Set(funding)
 }
 
+// retryBaseDelay is the first backoff step; a var so tests can shrink it.
+var retryBaseDelay = time.Second
+
+// errPoison marks a message that can never be applied (bad payload, unknown
+// subject); it is terminated instead of retried.
+var errPoison = errors.New("poison message")
+
 func (s *service) handle(ctx context.Context, m jetstream.Msg) {
-	// Funding and reconcile snapshots ride the same EXEC stream but carry
-	// different payloads, so they branch off before the ExecReport decode.
-	if m.Subject() == events.SubjFundingReceived {
-		s.handleFunding(ctx, m)
-		return
+	err := retryUntilApplied(ctx, m, s.log, func(ctx context.Context) error {
+		return s.apply(ctx, m)
+	})
+	switch {
+	case err == nil:
+		m.Ack()
+	case errors.Is(err, errPoison):
+		s.log.Error("dropping unprocessable message", "subject", m.Subject(), "err", err)
+		m.Term()
+	default:
+		// Shutting down mid-retry: hand the fact back for the next start.
+		m.Nak()
 	}
-	if m.Subject() == events.SubjReconciled {
-		s.handleReconciled(ctx, m)
-		return
+}
+
+// retryUntilApplied runs fn until it succeeds, fails with errPoison, or ctx
+// ends. Every handler error short of poison is a database failure (business
+// no-ops return nil), so retrying is always safe, and giving up would lose the
+// fact. A permanent DB error stalls the ledger here; ledgerStalled says so.
+func retryUntilApplied(ctx context.Context, m jetstream.Msg, log *slog.Logger, fn func(context.Context) error) error {
+	delay := retryBaseDelay
+	for attempt := 1; ; attempt++ {
+		actx, cancel := context.WithTimeout(ctx, attemptTimeout)
+		err := fn(actx)
+		cancel()
+		if err == nil || errors.Is(err, errPoison) {
+			ledgerStalled.Set(0)
+			return err
+		}
+		ledgerStalled.Set(1)
+		log.Warn("ledger write failed, retrying", "subject", m.Subject(), "attempt", attempt, "in", delay, "err", err)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(delay):
+		}
+		m.InProgress()
+		delay = min(delay*2, retryMaxDelay)
+	}
+}
+
+// apply books one fact. Funding and reconcile snapshots ride the same EXEC
+// stream but carry different payloads, so they branch off before the
+// ExecReport decode.
+func (s *service) apply(ctx context.Context, m jetstream.Msg) error {
+	switch m.Subject() {
+	case events.SubjFundingReceived:
+		var f events.FundingReceived
+		if err := json.Unmarshal(m.Data(), &f); err != nil {
+			return fmt.Errorf("%w: unmarshal funding: %v", errPoison, err)
+		}
+		return s.onFunding(ctx, f)
+	case events.SubjReconciled:
+		var r events.Reconciled
+		if err := json.Unmarshal(m.Data(), &r); err != nil {
+			return fmt.Errorf("%w: unmarshal reconciled: %v", errPoison, err)
+		}
+		return s.onReconciled(ctx, r)
 	}
 
 	var r events.ExecReport
 	if err := json.Unmarshal(m.Data(), &r); err != nil {
-		s.log.Error("unmarshal exec report", "err", err)
-		m.Term()
-		return
+		return fmt.Errorf("%w: unmarshal exec report: %v", errPoison, err)
 	}
-
-	var err error
 	switch m.Subject() {
 	case events.SubjPositionOpened:
-		err = s.onOpened(ctx, r)
+		return s.onOpened(ctx, r)
 	case events.SubjPositionClosed:
-		err = s.onClosed(ctx, r)
+		return s.onClosed(ctx, r)
 	case events.SubjPositionResized:
-		err = s.onResized(ctx, r)
+		return s.onResized(ctx, r)
 	case events.SubjExecFailed:
 		s.log.Warn("exec failed", "intent", r.IntentID, "error", r.Error)
+		return nil
 	default:
-		s.log.Error("unknown exec subject", "subject", m.Subject())
-		m.Term()
-		return
+		return fmt.Errorf("%w: unknown exec subject %q", errPoison, m.Subject())
 	}
-
-	// A DB error is transient (connection blip) — nak to retry. Business no-ops
-	// (idempotent replay, close with no open) return nil and are acked.
-	if err != nil {
-		s.log.Warn("db write failed, will retry", "intent", r.IntentID, "err", err)
-		m.Nak()
-		return
-	}
-	m.Ack()
 }
 
 const insertOpen = `
@@ -367,18 +424,20 @@ const applyGrow = `
 UPDATE positions
 SET entry_spot_price = CASE WHEN $3::float8 > 0 THEN (entry_spot_price * qty + $3 * $2::float8) / (qty + $2) ELSE entry_spot_price END,
     entry_perp_price = CASE WHEN $4::float8 > 0 THEN (entry_perp_price * qty + $4 * $2) / (qty + $2) ELSE entry_perp_price END,
-    qty              = qty + $2,
+    qty              = round((qty + $2)::numeric, 8)::float8,
     fees             = fees + $5
 WHERE id = $1;`
 
 // A shrink closes $2 coins of each leg at the fill prices: that slice's P&L is
 // banked in realized_partial and the entries of what remains are untouched.
+// qty is rounded in both statements: float8 sums like 0.64 − 0.22 otherwise
+// store 0.42000000000000004.
 const applyShrink = `
 UPDATE positions
 SET realized_partial = realized_partial
                      + CASE WHEN $3::float8 > 0 THEN ($3 - entry_spot_price) * $2::float8 ELSE 0 END
                      + CASE WHEN $4::float8 > 0 THEN (entry_perp_price - $4) * $2 ELSE 0 END,
-    qty              = qty - $2,
+    qty              = round((qty - $2)::numeric, 8)::float8,
     fees             = fees + $5
 WHERE id = $1;`
 
@@ -428,40 +487,16 @@ func (s *service) onResized(ctx context.Context, r events.ExecReport) error {
 	return tx.Commit(ctx)
 }
 
-func (s *service) handleFunding(ctx context.Context, m jetstream.Msg) {
-	var f events.FundingReceived
-	if err := json.Unmarshal(m.Data(), &f); err != nil {
-		s.log.Error("unmarshal funding", "err", err)
-		m.Term()
-		return
-	}
-	if err := s.onFunding(ctx, f); err != nil {
-		s.log.Warn("db write failed, will retry", "payment", f.PaymentID, "err", err)
-		m.Nak()
-		return
-	}
-	m.Ack()
-}
-
-// handleReconciled checks order-service's exchange snapshot against the ledger:
+// onReconciled checks order-service's exchange snapshot against the ledger:
 // both should agree on whether a position is held. A mismatch is only reported
 // (warn log + gauge for alerting) — the ledger is history, not live state, and
 // deciding what to do about a divergence is the human's call. The gauge also
 // resets on agreement, so it tracks the *latest* snapshot.
-func (s *service) handleReconciled(ctx context.Context, m jetstream.Msg) {
-	var r events.Reconciled
-	if err := json.Unmarshal(m.Data(), &r); err != nil {
-		s.log.Error("unmarshal reconciled", "err", err)
-		m.Term()
-		return
-	}
-
+func (s *service) onReconciled(ctx context.Context, r events.Reconciled) error {
 	var openCount int
 	if err := s.pool.QueryRow(ctx,
 		`SELECT count(*) FROM positions WHERE status = 'open'`).Scan(&openCount); err != nil {
-		s.log.Warn("reconcile check: query ledger failed, will retry", "err", err)
-		m.Nak()
-		return
+		return err
 	}
 
 	ledgerOpen := openCount > 0
@@ -481,7 +516,7 @@ func (s *service) handleReconciled(ctx context.Context, m jetstream.Msg) {
 		s.log.Info("reconcile: ledger agrees with exchange",
 			"verdict", r.Verdict, "open_positions", openCount)
 	}
-	m.Ack()
+	return nil
 }
 
 const insertFunding = `
